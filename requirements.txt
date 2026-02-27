@@ -1,0 +1,45 @@
+colorama @ file:///C:/b/abs_a9ozq0l032/croot/colorama_1672387194846/work
+contourpy @ file:///C:/b/abs_f2u2o_8s9g/croot/contourpy_1732540071787/work
+cx_Oracle==8.2.1
+cycler @ file:///tmp/build/80754af9/cycler_1637851556182/work
+diskcache==5.6.3
+et-xmlfile==1.1.0
+filelock==3.20.0
+fonttools @ file:///C:/miniconda3/conda-bld/fonttools_1759754888458/work
+fsspec==2025.9.0
+greenlet==3.0.3
+Jinja2==3.1.6
+kiwisolver @ file:///C:/b/abs_faf90xet7a/croot/kiwisolver_1737040915779/work
+lxml==5.3.0
+MarkupSafe==3.0.3
+matplotlib==3.10.6
+mkl-service==2.5.2
+mkl_fft @ file:///C:/b/abs_64riv3lfyn/croot/mkl_fft_1751310924052/work
+mkl_random @ file:///C:/b/abs_47jvsmau4j/croot/mkl_random_1751310922820/work
+mpmath==1.3.0
+networkx==3.4.2
+numpy==1.26.4
+openpyxl==3.1.5
+packaging @ file:///C:/miniconda3/conda-bld/packaging_1761049101700/work
+pandas==2.2.2
+pillow @ file:///C:/b/abs_b06nvnir5m/croot/pillow_1752524543576/work
+platformdirs==4.2.2
+pyodbc==5.1.0
+pyparsing @ file:///C:/b/abs_40z8gyj9wi/croot/pyparsing_1731445739241/work
+PyQt6==6.9.1
+PyQt6_sip @ file:///C:/miniconda3/conda-bld/pyqt-split_1757511038965/work/pyqt_sip
+python-dateutil==2.9.0.post0
+pytz==2024.1
+sip @ file:///C:/b/abs_f6ow8vlbb7/croot/sip_1756224172742/work
+six==1.16.0
+SQLAlchemy==2.0.32
+sympy==1.13.1
+tomli @ file:///C:/b/abs_88e598m6o8/croot/tomli_1753774604115/work
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+torchvision==0.21.0+cu124
+tornado @ file:///C:/b/abs_7dzpc171lf/croot/tornado_1748956950306/work
+tqdm @ file:///C:/b/abs_0eh9b6xugj/croot/tqdm_1738945553987/work
+typing_extensions==4.15.0
+tzdata==2024.1
+xmltodict==0.13.0
