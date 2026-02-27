@@ -1,0 +1,196 @@
+import math
+from typing import Any, Dict, Tuple
+
+import torch
+
+
+def build_L(n: int, offdiag: float = 1.0) -> torch.Tensor:
+    """All-ones off-diagonal exposure matrix (diag=0)."""
+    L = torch.ones(n, n, dtype=torch.float32) * float(offdiag)
+    L.fill_diagonal_(0.0)
+    return L
+
+
+def build_matrices(cfg: Dict[str, Any], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build the interbank exposure matrix and implied liabilities.
+
+    Returns
+    -------
+    (L, liab)
+      L    : (n,n) exposure matrix with diag=0 and offdiag=kL/(n-1)
+      liab : (n,)  interbank liabilities, i.e. row sums of L
+
+    Notes
+    -----
+    Outside liabilities are assumed to be absorbed into the external asset
+    variable A ("distance-to-default") at t=0.
+    """
+    n = int(cfg["N_BANKS"])
+    kL = float(cfg.get("kL", 1.0))
+
+    if n <= 1:
+        raise ValueError(f"N_BANKS must be >= 2 (got {n}).")
+
+    L = build_L(n, offdiag=kL / (n - 1))
+    liab = L.sum(1)
+    return L.to(device), liab.to(device)
+
+
+# -------------------------- shared initial sampling --------------------------
+
+@torch.no_grad()
+def sample_A0_band(
+    S: int,
+    n: int,
+    *,
+    init_dd: float,
+    sigma: float,
+    rho: float,
+    T_steps: int,
+    dt: float,
+    device: torch.device,
+    band_mult: float = 1.0,
+    init_jitter: float = 0.0,
+    stress_prob: float = 0.0,
+    stress_shift: float = 0.0,
+) -> torch.Tensor:
+    """Scenario-band sampler for the initial asset state A(0).
+
+    This is the shared implementation used by:
+      - sc_data.build_rollout_paths
+      - sc_staticbarrier_benchmark (state-dependent static-barrier benchmark)
+
+    The construction follows the LaTeX description:
+      - scenario-level base drawn uniformly in a band around INIT_DD
+      - optional stressed mixture (scenario-level shift)
+      - optional per-bank jitter, scaled by sqrt(1-rho) so dispersion shrinks as rho -> 1
+
+    Parameters
+    ----------
+    S : number of scenarios
+    n : number of banks
+    init_dd : center of the band
+    sigma : ABM volatility (only used to set the band width)
+    rho : one-factor correlation in [0,1]
+    T_steps, dt : used to set the band width via sqrt(T_steps*dt)
+    device : torch device
+
+    Returns
+    -------
+    A0 : (S, n) float tensor
+    """
+    S_ = int(S)
+    n_ = int(n)
+    T_steps_ = int(T_steps)
+    dt_ = float(dt)
+
+    # Same functional form as in the original rollout sampler.
+    base_width = float(band_mult) * (0.4 + 0.1 * float(sigma) * math.sqrt(max(T_steps_ * dt_, 1e-8)))
+
+    base = torch.empty(S_, 1, device=device).uniform_(float(init_dd) - base_width, float(init_dd) + base_width)
+
+    if float(stress_prob) > 0.0 and float(stress_shift) != 0.0:
+        stress_mask = (torch.rand(S_, 1, device=device) < float(stress_prob)).float()
+        base = base + stress_mask * float(stress_shift)
+
+    if float(init_jitter) > 0.0:
+        jitter_sd = float(init_jitter) * base_width * math.sqrt(max(0.0, 1.0 - float(rho)))
+        A0 = base + torch.randn(S_, n_, device=device) * jitter_sd
+    else:
+        A0 = base.expand(S_, n_).clone()
+
+    return A0
+
+
+# ---------- ABM survival / breach proxy (counterparty-aware, iterated) ----------
+
+@torch.no_grad()
+def draw_shocks_factor(
+    sz: int,
+    n: int,
+    rho: float,
+    sigma: float,
+    dt: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Correlated ABM increments via a single common-factor decomposition.
+
+    Output shape: (sz, n)
+
+    Note: this construction assumes rho in [0,1].
+    """
+    scale = float(sigma) * math.sqrt(float(dt))
+    mkt = torch.randn(int(sz), 1, device=device)  # common market factor M
+    idio = torch.randn(int(sz), int(n), device=device)  # idiosyncratic eps_i
+    return scale * (math.sqrt(float(rho)) * mkt + math.sqrt(1.0 - float(rho)) * idio)
+
+
+@torch.no_grad()
+def _survival_abm(
+    A: torch.Tensor,
+    H: torch.Tensor,
+    sigma: float,
+    T: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """ABM survival above a flat barrier.
+
+    Arithmetic Brownian motion: X_t = A + sigma * W_t, flat barrier H.
+
+    Survival (no down-crossing) by horizon T:
+        P_surv = 2 * Phi((A - H) / (sigma * sqrt(T))) - 1.
+    """
+    T_eff = max(float(T), eps)
+    denom = max(float(sigma) * math.sqrt(T_eff), eps)
+    d = (A - H) / denom
+    cdf = 0.5 * (1.0 + torch.erf(d / math.sqrt(2.0)))
+    out = 2.0 * cdf - 1.0
+    return torch.clamp(out, 0.0, 1.0)
+
+
+@torch.no_grad()
+def iterative_survival_feature(
+    A: torch.Tensor,
+    L: torch.Tensor,
+    liab: torch.Tensor,
+    sigma: float,
+    T: float,
+    k: int = 5,
+    a_dead: float = -10.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Counterparty-aware survival phi via fixed point on expected payments.
+
+    Alive is inferred from assets via the sentinel: A > a_dead.
+    """
+    liab_row = liab.unsqueeze(0)
+    S = (A > (float(a_dead) + eps)).float()
+
+    spay = S  # initial guess: survivors pay 1
+    H = liab_row - (spay @ L)
+    phi = _survival_abm(A, H, float(sigma), float(T), eps)
+    phi = torch.minimum(phi, S)
+
+    for _ in range(int(max(0, k))):
+        spay = torch.minimum(S, phi)
+        H = liab_row - (spay @ L)
+        phi = _survival_abm(A, H, float(sigma), float(T), eps)
+        phi = torch.minimum(phi, S)
+
+    return phi
+
+
+@torch.no_grad()
+def iterative_breach_feature(
+    A: torch.Tensor,
+    L: torch.Tensor,
+    liab: torch.Tensor,
+    sigma: float,
+    T: float,
+    k: int = 5,
+    a_dead: float = -10.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Barrier breach probability psi = 1 - phi_survival (ABM, iterated)."""
+    surv = iterative_survival_feature(A, L, liab, sigma, T, k, a_dead, eps)
+    return 1.0 - surv
