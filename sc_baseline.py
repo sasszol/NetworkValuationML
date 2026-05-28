@@ -223,6 +223,12 @@ def baseline_from_generator(
     # -------- network matrices (needed only for overlay / psi) ---------------
     L, liab = build_matrices(cfg, device)
 
+    # Optional rank-1 acceleration when the symmetric/homogeneous network is assumed.
+    # Derived once and forwarded to every clearing-related primitive below so that
+    # the overlay path and the t=0 ψ diagnostic both see the speedup.
+    use_sym = bool(cfg.get("USE_SYMMETRIC_ASSUMPTION", False))
+    ell = (float(cfg.get("kL", 1.0)) / max(1, n - 1)) if use_sym else None
+
     # -------- base ABM + Brownian-bridge barrier defaults --------------------
     A_path, dR_all, alive0 = build_rollout_paths(
         S=S, n=n, T=T, dt=dt, device=device,
@@ -242,6 +248,7 @@ def baseline_from_generator(
             extra_cap=extra_cap,
             extra_rho=extra_rho,  # None -> use rho inside
             seed=seed,
+            ell=ell,
         )
         # keep the modified path
         A_path = A_path2
@@ -324,6 +331,7 @@ def baseline_from_generator(
                 T=T_total,
                 k=k_surv,
                 a_dead=a_dead,
+                ell=ell,
             ).detach().cpu().numpy()
             psi0_np = psi0
 

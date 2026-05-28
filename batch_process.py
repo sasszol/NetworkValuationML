@@ -6,18 +6,58 @@ This file is used in two ways:
   1) as a config module (CFG dict) consumed by training/benchmark scripts
   2) as an executable to run a quick correlation sweep
 
-Key switch
----------
-NAIVE_PATHS_METHOD controls which *naive multi-step buffer generator* is used
-when USE_ROLLOUT_PATHS=True in sc_train:
+Key switches
+------------
+NAIVE_PATHS_METHOD
+  Controls which *naive multi-step buffer generator* is used when
+  USE_ROLLOUT_PATHS=True in sc_train:
 
-  - "sc_data"         : rollout sampler from sc_data (Brownian-bridge barrier hits
-                         + optional EXTRA_DEFAULTS overlay)
-  - "static_barrier"  : SDB benchmark buffer generator (Picard fixed-point +
-                         projection each step)
+    - "sc_data"         : rollout sampler from sc_data (Brownian-bridge
+                           barrier hits + optional EXTRA_DEFAULTS overlay)
+    - "static_barrier"  : SDB benchmark buffer generator (Picard fixed-point
+                           + projection each step)
 
-The same value can also be used as the sweep method when running this file as a
-script.
+  The same value can also be used as the sweep method when running this file
+  as a script.
+
+USE_DEEPSETS  (architecture switch)
+  False -> use the original BaseMLP predictor (Flatten -> 64 -> 64 -> 32 -> N).
+  True  -> use the DeepSets predictor (permutation-equivariant by construction;
+           parameter count independent of N; supports zero-shot transfer to
+           other N values). See deepsets_vs_mlp.tex for the full discussion.
+
+USE_SYMMETRIC_ASSUMPTION  (computational switch; valid iff the homogeneous
+                            symmetric network of the paper's Assumption is in
+                            force, i.e. L_ij = kL/(N-1) off-diagonal, b_i =
+                            kL, common a_0).
+  When True, the following optimisations are enabled jointly:
+
+    * Layer-1 rank-1 / diagonal factorisation of L in every clearing-related
+      primitive (hard_clear_pd, ste_clear_pd, LastStepPDIter,
+      projected_static_barrier_fp, iterative_survival_feature). Brings the
+      per-scenario clearing cost from O(N^3) to O(N^2). Numerics are exact
+      up to floating-point ordering.
+
+    * Layer-4 sharing of the "pre-shock" time-t clearing across MC replicas
+      inside simulate_one_step_with_projection: replicas of the same scenario
+      share the same A_t, hence the same pd_t / s_t.
+
+    * Option B (data-side symmetrisation):
+        - permutation augmentation of training batches (joint S_n permutation
+          of A, psi, target). For a non-equivariant predictor this teaches the
+          symmetry directly from data and improves sample efficiency, so
+          fewer K_MC may be sufficient at the same target MSE.
+
+  Note: an earlier draft also collapsed per-agent TD targets to the
+  within-scenario mean over alive agents ("Rao-Blackwell"). That step was
+  removed because it is biased: under the symmetric assumption the joint law
+  of A_t is exchangeable, but a single realisation is heterogeneous from t>0
+  onward (different idiosyncratic shocks per bank), so each per-agent target
+  estimates a different conditional expectation and pathwise averaging biases
+  the TD target.
+
+  The two flags are independent: you may enable the architecture refactor
+  without the symmetric-assumption optimisations and vice versa.
 """
 
 import numpy as np
@@ -61,6 +101,18 @@ CFG = dict(
     EVAL_PATIENCE=10,
     EVAL_MIN_DELTA=0.0,
     VAL_SAMPLES=5_000,
+
+    # ----------------- Architecture switch -----------------
+    # False -> original BaseMLP (Flatten -> 64 -> 64 -> 32 -> N)
+    # True  -> DeepSets (permutation-equivariant; parameter count independent of N)
+    USE_DEEPSETS=False,
+
+    # ----------------- Symmetric-assumption switch -----------------
+    # Enables the rank-1 clearing fast path AND permutation augmentation of
+    # training batches AND sharing of the pre-shock clearing across MC
+    # replicas. Only valid when the homogeneous symmetric network assumption
+    # is in force.
+    USE_SYMMETRIC_ASSUMPTION=False,
 
     # Final-step / clearing params
     A_DEAD=-4.0,

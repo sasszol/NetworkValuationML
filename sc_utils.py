@@ -148,32 +148,50 @@ def _survival_abm(
     return torch.clamp(out, 0.0, 1.0)
 
 
+def _apply_L_util(spay: torch.Tensor,
+                  L: "torch.Tensor | None",
+                  ell: "float | None") -> torch.Tensor:
+    """Compute spay @ L, optionally exploiting the symmetric rank-1 form.
+
+    Mirror of sc_core._apply_L; duplicated here to avoid a circular import.
+    """
+    if ell is not None:
+        Sigma = spay.sum(dim=-1, keepdim=True)
+        return float(ell) * (Sigma - spay)
+    return spay @ L
+
+
 @torch.no_grad()
 def iterative_survival_feature(
     A: torch.Tensor,
-    L: torch.Tensor,
+    L: "torch.Tensor | None",
     liab: torch.Tensor,
     sigma: float,
     T: float,
     k: int = 5,
     a_dead: float = -10.0,
     eps: float = 1e-8,
+    *,
+    ell: "float | None" = None,
 ) -> torch.Tensor:
     """Counterparty-aware survival phi via fixed point on expected payments.
 
     Alive is inferred from assets via the sentinel: A > a_dead.
+
+    If `ell` is provided, uses the symmetric rank-1 form of L
+    (L = ell*(11^T - I)); `L` may then be passed as None.
     """
     liab_row = liab.unsqueeze(0)
     S = (A > (float(a_dead) + eps)).float()
 
     spay = S  # initial guess: survivors pay 1
-    H = liab_row - (spay @ L)
+    H = liab_row - _apply_L_util(spay, L, ell)
     phi = _survival_abm(A, H, float(sigma), float(T), eps)
     phi = torch.minimum(phi, S)
 
     for _ in range(int(max(0, k))):
         spay = torch.minimum(S, phi)
-        H = liab_row - (spay @ L)
+        H = liab_row - _apply_L_util(spay, L, ell)
         phi = _survival_abm(A, H, float(sigma), float(T), eps)
         phi = torch.minimum(phi, S)
 
@@ -183,14 +201,16 @@ def iterative_survival_feature(
 @torch.no_grad()
 def iterative_breach_feature(
     A: torch.Tensor,
-    L: torch.Tensor,
+    L: "torch.Tensor | None",
     liab: torch.Tensor,
     sigma: float,
     T: float,
     k: int = 5,
     a_dead: float = -10.0,
     eps: float = 1e-8,
+    *,
+    ell: "float | None" = None,
 ) -> torch.Tensor:
     """Barrier breach probability psi = 1 - phi_survival (ABM, iterated)."""
-    surv = iterative_survival_feature(A, L, liab, sigma, T, k, a_dead, eps)
+    surv = iterative_survival_feature(A, L, liab, sigma, T, k, a_dead, eps, ell=ell)
     return 1.0 - surv

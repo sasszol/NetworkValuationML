@@ -152,11 +152,17 @@ def apply_extra_defaults_per_step(
     extra_cap: float = 0.35,        # ceiling for per‑name extra default probability
     extra_rho: Optional[float] = None,  # correlation for the copula (defaults to ASSET_CORR)
     seed: int = 0,
+    ell: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Adds per‑step *stochastic* defaults highly correlated with A (and network via ψ),
     but not 1‑to‑1: p_extra = λ * ψ(A_t). Sampling uses a 1‑factor Gaussian copula
     with correlation extra_rho.
+
+    If ``ell`` is provided (homogeneous symmetric network: L_ij = ell off-diagonal,
+    L_ii = 0), ψ is computed via the rank-1 fast path (O(N) per scenario instead of
+    O(N^2)). Pass ``ell = kL / (N - 1)`` when ``USE_SYMMETRIC_ASSUMPTION`` is True.
+
     Returns (A_path_with_overlay, alive_path_with_overlay).
     """
     if not extra_on or extra_intensity <= 0.0 or extra_cap <= 0.0:
@@ -184,7 +190,8 @@ def apply_extra_defaults_per_step(
         # Only compute ψ for still‑alive names (others are fixed at a_dead)
         psi_t = iterative_breach_feature(A_t, L, liab,
                                          sigma=float(sigma), T=T_now,
-                                         k=int(k_surv_iters), a_dead=float(a_dead))
+                                         k=int(k_surv_iters), a_dead=float(a_dead),
+                                         ell=ell)
         # map ψ → extra default probability; clip to avoid 0/1
         p_extra = torch.clamp(psi_t * float(extra_intensity), 0.0, float(extra_cap))
         p_extra = torch.where(A_t <= barrier, torch.zeros_like(p_extra), p_extra)
@@ -234,6 +241,7 @@ def multistep_asset_buffers(
     L: Optional[torch.Tensor] = None,
     liab: Optional[torch.Tensor] = None,
     T_total: Optional[float] = None,
+    ell: Optional[float] = None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
     """
     High‑level convenience: build path‑consistent per‑step buffers for training.
@@ -258,7 +266,8 @@ def multistep_asset_buffers(
             k_surv_iters=k_surv_iters,
             extra_on=True, extra_intensity=extra_intensity, extra_cap=extra_cap,
             extra_rho=extra_rho if extra_rho is not None else rho,
-            seed=seed
+            seed=seed,
+            ell=ell,
         )
     else:
         alive_path = alive0

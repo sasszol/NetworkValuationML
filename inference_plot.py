@@ -138,6 +138,83 @@ class _PDInfer(nn.Module):
         return self.mlp(x).unsqueeze(-1)  # (B, n, 1)
 
 
+# ---- DeepSets variant (matches sc_core.DeepSetsPD; loaded from checkpoints
+#      saved by training runs with USE_DEEPSETS=True) ------------------------
+
+class _DynamicDeepSets(nn.Module):
+    """DeepSets backbone whose dimensions are inferred from a checkpoint.
+
+    Mirrors sc_core.DeepSetsPD. The same trained weights can be evaluated on
+    any number of agents N (parameter count is N-independent).
+    """
+    def __init__(self, F: int, d_embed: int, h_hidden: int):
+        super().__init__()
+        self.F = int(F)
+        self.d_embed = int(d_embed)
+        self.phi = nn.Sequential(
+            nn.Linear(self.F, self.d_embed),
+            nn.ReLU(),
+            nn.Linear(self.d_embed, self.d_embed),
+        )
+        self.g = nn.Sequential(
+            nn.Linear(self.F + self.d_embed, h_hidden),
+            nn.ReLU(),
+            nn.Linear(h_hidden, h_hidden),
+            nn.ReLU(),
+            nn.Linear(h_hidden, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e = self.phi(x)
+        S = e.sum(dim=1, keepdim=True)
+        others = S - e
+        h = torch.cat([x, others], dim=-1)
+        return self.g(h).squeeze(-1)
+
+
+class _PDInferDeepSets(nn.Module):
+    """PD head wrapping the DeepSets backbone."""
+    def __init__(self, n: int, F: int, d_embed: int, h_hidden: int):
+        super().__init__()
+        self.mlp = _DynamicDeepSets(F, d_embed, h_hidden)
+        self.n = int(n)  # the n the model was *trained* at; not enforced at eval
+        self.in_features_per_node = int(F)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x).unsqueeze(-1)
+
+
+def _is_deepsets_sd(sd: Dict[str, torch.Tensor]) -> bool:
+    return any(k.startswith("mlp.phi.") or k.startswith("mlp.g.") for k in sd.keys())
+
+
+def _infer_deepsets_dims(sd: Dict[str, torch.Tensor]) -> Tuple[int, int, int]:
+    """Infer (F, d_embed, h_hidden) from a DeepSets checkpoint.
+
+    Layout (sc_core.DeepSetsPD):
+      mlp.phi.0.weight: (d_embed, F)
+      mlp.phi.2.weight: (d_embed, d_embed)
+      mlp.g.0.weight  : (h_hidden, F + d_embed)
+      mlp.g.4.weight  : (1, h_hidden)
+    """
+    try:
+        wp0 = sd["mlp.phi.0.weight"]
+        wg0 = sd["mlp.g.0.weight"]
+        wg_last = sd["mlp.g.4.weight"]
+    except KeyError as e:
+        raise RuntimeError(f"DeepSets checkpoint missing expected key: {e}")
+    d_embed, F = wp0.shape
+    h_hidden_a, in_g = wg0.shape
+    one, h_hidden_b = wg_last.shape
+    if h_hidden_a != h_hidden_b or one != 1:
+        raise RuntimeError("inconsistent DeepSets g-MLP shapes in checkpoint")
+    if in_g != F + d_embed:
+        raise RuntimeError(
+            f"DeepSets g-MLP input dim {in_g} != F+d_embed = {F + d_embed}"
+        )
+    return int(F), int(d_embed), int(h_hidden_a)
+
+
 # ----------------------------- loading & inference --------------------------
 
 @torch.no_grad()
@@ -147,8 +224,12 @@ def _parse_rho(path: Path) -> Optional[float]:
 
 
 @torch.no_grad()
-def _load_model_from_ckpt(ckpt: Path) -> Tuple[float, _PDInfer]:
-    """Load one 'step0_corr_{rho}.pt' and return (rho, model)."""
+def _load_model_from_ckpt(ckpt: Path):
+    """Load one 'step0_corr_{rho}.pt' and return (rho, model).
+
+    Returns either a _PDInfer (flat MLP) or a _PDInferDeepSets, transparently
+    dispatched on the saved state-dict keys.
+    """
     rho = _parse_rho(ckpt)
     if rho is None:
         raise ValueError(f"filename does not match step0_corr_*.pt pattern: {ckpt}")
@@ -158,6 +239,22 @@ def _load_model_from_ckpt(ckpt: Path) -> Tuple[float, _PDInfer]:
         raise RuntimeError(f"checkpoint must be a state_dict (dict), got {type(raw)}")
 
     sd = _normalize_state_dict(raw)
+
+    if _is_deepsets_sd(sd):
+        F, d_embed, h_hidden = _infer_deepsets_dims(sd)
+        if F not in (1, 2):
+            raise RuntimeError(
+                f"DeepSets checkpoint expects F={F} features per node; "
+                f"only F=1 or F=2 are supported by this plotter."
+            )
+        # n is not stored in the DeepSets state-dict (the model is N-agnostic);
+        # downstream code passes A explicitly, so we just record a placeholder.
+        n_placeholder = 1
+        model = _PDInferDeepSets(n_placeholder, F, d_embed, h_hidden)
+        model.load_state_dict(sd, strict=True)
+        model.eval()
+        return rho, model
+
     n, F, H1, H2, H3 = _infer_dims(sd)
 
     # only support the new ABM pipeline (A-only or A+ψ)
@@ -259,9 +356,16 @@ def plot_pd_vs_rho(
     if not ckpts:
         raise FileNotFoundError(f"No 'step0_corr_*.pt' files in {model_dir}")
 
-    # First model defines n (and F) for broadcasting input
+    # First model defines n (and F) for broadcasting input.
+    # For DeepSets the model is N-agnostic; in that case n is inferred from
+    # the length of `A_vals` (or set to 1 if a scalar was passed, which then
+    # also implies n=1 — usually you'd pass a vector for DeepSets eval).
     rho0, model0 = _load_model_from_ckpt(ckpts[0])
-    n = model0.n
+    is_deepsets = isinstance(model0, _PDInferDeepSets)
+    if is_deepsets:
+        n = max(int(len(A_vals)), 1)
+    else:
+        n = model0.n
     A_vec = _broadcast_np(A_vals, n, "A")
 
     # Build clearing matrices once (ρ affects training dR, not L here)
@@ -283,7 +387,7 @@ def plot_pd_vs_rho(
     # Remaining checkpoints
     for f in ckpts[1:]:
         rho, model = _load_model_from_ckpt(f)
-        if model.n != n:
+        if (not isinstance(model, _PDInferDeepSets)) and model.n != n:
             raise RuntimeError(f"Mixed n across checkpoints: expected {n}, found {model.n} in {f.name}")
         pd = predict_pd_postclearing(model, A_t, sigma=sigma, T_total=T_total,
                                      dt=dt, step=step, k_surv_iters=k_surv_iters,
