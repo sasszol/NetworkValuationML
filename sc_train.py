@@ -6,6 +6,7 @@ from typing import Dict, Iterable, Tuple, List, Any, Optional, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import trange
 
 from sc_core import (
@@ -156,6 +157,423 @@ def np_round(x, k: int = 4):
         return _np.round(x, k).tolist()
     except Exception:
         return x
+
+# ----------------------- joint live-target training -------------------------
+
+def _input_for_step_net(net: nn.Module,
+                        step: int,
+                        A: torch.Tensor,
+                        cfg: Dict[str, Any],
+                        L: torch.Tensor,
+                        liab: torch.Tensor,
+                        *,
+                        psi_precomputed: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Build the feature tensor expected by a time-step model.
+
+    The data-generation buffers remain assets-only.  If the model was built with
+    the counterparty breach feature, this computes or reuses psi(A, t).
+    """
+    use_phi = bool(cfg.get("USE_PHI_FEATURE", True))
+    wants_phi = (not isinstance(net, LastStepPDIter)) and getattr(net, "in_features_per_node", 1) >= 2
+    if use_phi and wants_phi:
+        if psi_precomputed is None:
+            T_now = max(float(cfg["T_TOTAL"]) - int(step) * float(cfg["DT"]), 1e-8)
+            psi = iterative_breach_feature(
+                A, L, liab,
+                sigma=float(cfg["SIGMA"]),
+                T=T_now,
+                k=int(cfg.get("K_SURV_ITERS", 5)),
+                a_dead=float(cfg.get("A_DEAD", -10.0)),
+            )
+        else:
+            psi = psi_precomputed
+        return torch.stack([A, psi], dim=-1)
+    return A.unsqueeze(-1)
+
+
+def _build_psi_buffers(cfg: Dict[str, Any],
+                       A_buf_list: Sequence[torch.Tensor],
+                       L: torch.Tensor,
+                       liab: torch.Tensor) -> List[Optional[torch.Tensor]]:
+    """Precompute psi for the fixed training buffers, matching the old loop."""
+    if not bool(cfg.get("USE_PHI_FEATURE", True)):
+        return [None for _ in A_buf_list]
+
+    out: List[Optional[torch.Tensor]] = []
+    k_phi = int(cfg.get("K_SURV_ITERS", 5))
+    a_dead = float(cfg.get("A_DEAD", -10.0))
+    for step, A_buf in enumerate(A_buf_list):
+        T_now = max(float(cfg["T_TOTAL"]) - int(step) * float(cfg["DT"]), 1e-8)
+        out.append(iterative_breach_feature(
+            A_buf, L, liab,
+            sigma=float(cfg["SIGMA"]), T=T_now, k=k_phi, a_dead=a_dead,
+        ))
+    return out
+
+
+def _select_joint_steps(T: int, cfg: Dict[str, Any], device: torch.device) -> List[int]:
+    """Which time networks contribute to the next joint optimizer step.
+
+    Default is all times, i.e. a full synchronous joint TD update.  A smaller
+    integer can be used for memory/runtime, while still using one optimizer over
+    all networks and live detached targets.
+    """
+    spec = cfg.get("JOINT_TIMES_PER_STEP", cfg.get("TIMES_PER_STEP", "all"))
+    if isinstance(spec, str):
+        s = spec.strip().lower()
+        if s in {"all", "full", "every", "*"}:
+            return list(range(int(T)))
+        k = int(s)
+    else:
+        k = int(spec)
+
+    if k >= int(T):
+        return list(range(int(T)))
+    if k <= 0:
+        raise ValueError(f"JOINT_TIMES_PER_STEP must be positive or 'all' (got {spec!r}).")
+    return sorted(torch.randperm(int(T), device=device)[:k].detach().cpu().tolist())
+
+
+def _joint_td_target(cfg: Dict[str, Any],
+                     nets: Sequence[nn.Module],
+                     step: int,
+                     A_b: torch.Tensor,
+                     dR_b: torch.Tensor,
+                     L: torch.Tensor,
+                     liab: torch.Tensor,
+                     n_it: int,
+                     *,
+                     k_mc: int) -> torch.Tensor:
+    """Live one-step TD target, detached from all networks.
+
+    This is the key change from the old cached/frozen-teacher scheme.  The
+    target uses the current half-fitted next-step network, but the computation is
+    wrapped by simulate_one_step_with_projection's no_grad context, so no gradient
+    from L_t can update theta_{t+1}.
+    """
+    use_phi = bool(cfg.get("USE_PHI_FEATURE", True))
+    k_phi = int(cfg.get("K_SURV_ITERS", 5))
+    a_dead = float(cfg.get("A_DEAD", -10.0))
+
+    if int(k_mc) > 1:
+        A_rep = A_b.repeat_interleave(int(k_mc), dim=0)
+        dR_rep = draw_shocks_factor(
+            A_rep.shape[0], A_rep.shape[1],
+            float(cfg["ASSET_CORR"]), float(cfg["SIGMA"]), float(cfg["DT"]),
+            device=A_rep.device,
+        )
+        _, td_many, _ = simulate_one_step_with_projection(
+            nets, step, A_rep, dR_rep, L, liab, n_it,
+            sigma=float(cfg["SIGMA"]), T_total=float(cfg["T_TOTAL"]),
+            dt=float(cfg["DT"]), k_surv_iters=k_phi,
+            a_dead=a_dead, use_phi=use_phi,
+        )
+        target = td_many.view(-1, int(k_mc), int(cfg["N_BANKS"])).mean(dim=1)
+    else:
+        _, target, _ = simulate_one_step_with_projection(
+            nets, step, A_b, dR_b, L, liab, n_it,
+            sigma=float(cfg["SIGMA"]), T_total=float(cfg["T_TOTAL"]),
+            dt=float(cfg["DT"]), k_surv_iters=k_phi,
+            a_dead=a_dead, use_phi=use_phi,
+        )
+
+    target = target.detach().clamp(0.0, 1.0)
+    if target.requires_grad:
+        raise RuntimeError(
+            "TD target unexpectedly requires grad. Joint training must use live but detached targets, "
+            "not a full-gradient Bellman residual."
+        )
+    return target
+
+
+def _joint_loss_one_step(cfg: Dict[str, Any],
+                         nets: Sequence[nn.Module],
+                         step: int,
+                         idx: torch.Tensor,
+                         A_buf_list: Sequence[torch.Tensor],
+                         dR_buf_list: Sequence[torch.Tensor],
+                         psi_buf_list: Sequence[Optional[torch.Tensor]],
+                         L: torch.Tensor,
+                         liab: torch.Tensor,
+                         n_it: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Loss for one time slice inside the joint optimizer step."""
+    net = nets[int(step)]
+    A_b = A_buf_list[int(step)][idx]
+    dR_b = dR_buf_list[int(step)][idx]
+    psi_b = None if psi_buf_list[int(step)] is None else psi_buf_list[int(step)][idx]
+
+    x_b = _input_for_step_net(net, step, A_b, cfg, L, liab, psi_precomputed=psi_b)
+    logits = squeeze_last(net(x_b))
+    pd_raw = torch.sigmoid(logits).clamp(1e-8, 1.0 - 1e-8)
+
+    a_dead = float(cfg.get("A_DEAD", -10.0))
+    use_ste = bool(cfg.get("USE_STE_CLEARING", True))
+    if use_ste:
+        pd_pred = ste_clear_pd(pd_raw, A_b, L, liab, n_it, a_dead)
+    else:
+        # This branch preserves the old behaviour.  In practice training needs
+        # USE_STE_CLEARING=True, because hard_clear_pd is non-differentiable.
+        with torch.no_grad():
+            pd_pred, _ = hard_clear_pd(pd_raw, A_b, L, liab, n_it, a_dead)
+
+    target = _joint_td_target(
+        cfg, nets, step, A_b, dR_b, L, liab, n_it, k_mc=_k_mc_train(cfg),
+    )
+
+    per_elem = F.binary_cross_entropy(
+        pd_pred.clamp(1e-8, 1.0 - 1e-8),
+        target,
+        reduction="none",
+    )
+
+    mask_surv = bool(cfg.get("MASK_LOSS_TO_SURVIVORS", True))
+    if mask_surv:
+        with torch.no_grad():
+            _, s_curr = hard_clear_pd(pd_raw.detach(), A_b, L, liab, n_it, a_dead)
+        denom = s_curr.sum().clamp_min(1.0)
+        loss = (per_elem * s_curr).sum() / denom
+        active_frac = float(s_curr.mean().item())
+    else:
+        loss = per_elem.mean()
+        active_frac = 1.0
+
+    if not loss.requires_grad:
+        raise RuntimeError(
+            "Joint loss does not require gradients. Set USE_STE_CLEARING=True so the post-clearing "
+            "PD remains trainable through the straight-through clearing projection."
+        )
+
+    with torch.no_grad():
+        mse = F.mse_loss(pd_pred.detach(), target).item()
+        ce = per_elem.detach().mean().item()
+        tgt_mean = target.mean().item()
+        pred_mean = pd_pred.detach().mean().item()
+
+    return loss, {
+        "mse": float(mse),
+        "ce": float(ce),
+        "target_mean": float(tgt_mean),
+        "pred_mean": float(pred_mean),
+        "active_frac": float(active_frac),
+    }
+
+
+@torch.no_grad()
+def _validate_joint_td(cfg: Dict[str, Any],
+                       nets: Sequence[nn.Module],
+                       A_buf_list: Sequence[torch.Tensor],
+                       dR_buf_list: Sequence[torch.Tensor],
+                       psi_buf_list: Sequence[Optional[torch.Tensor]],
+                       L: torch.Tensor,
+                       liab: torch.Tensor,
+                       device: torch.device,
+                       val_idx: torch.Tensor) -> Dict[str, Any]:
+    """Validation Bellman residuals for all time slices."""
+    n_it = int(L.shape[0])
+    a_dead = float(cfg.get("A_DEAD", -10.0))
+    per_step_mse: List[float] = []
+    per_step_ce: List[float] = []
+    per_step_min_ce: List[float] = []
+
+    for step in range(int(cfg["TOTAL_STEPS"])):
+        net = nets[step]
+        A_v = A_buf_list[step][val_idx]
+        dR_v = dR_buf_list[step][val_idx]
+        psi_v = None if psi_buf_list[step] is None else psi_buf_list[step][val_idx]
+
+        x_v = _input_for_step_net(net, step, A_v, cfg, L, liab, psi_precomputed=psi_v)
+        logits_v = squeeze_last(net(x_v))
+        pd_raw_v = torch.sigmoid(logits_v).clamp(1e-8, 1.0 - 1e-8)
+        pd_pred_v, _ = hard_clear_pd(pd_raw_v, A_v, L, liab, n_it, a_dead)
+
+        true_v = _joint_td_target(
+            cfg, nets, step, A_v, dR_v, L, liab, n_it, k_mc=_k_mc_valid(cfg),
+        )
+
+        per_step_mse.append(float(F.mse_loss(pd_pred_v, true_v).item()))
+        per_step_ce.append(float(F.binary_cross_entropy(
+            pd_pred_v.clamp(1e-8, 1.0 - 1e-8), true_v, reduction="mean"
+        ).item()))
+        per_step_min_ce.append(float(approx_min_ce(true_v)))
+
+    mse_t = torch.tensor(per_step_mse, dtype=torch.float32, device=device)
+    ce_t = torch.tensor(per_step_ce, dtype=torch.float32, device=device)
+    return {
+        "mse_by_step": per_step_mse,
+        "ce_by_step": per_step_ce,
+        "min_ce_by_step": per_step_min_ce,
+        "mean_mse": float(mse_t.mean().item()),
+        "max_mse": float(mse_t.max().item()),
+        "mean_ce": float(ce_t.mean().item()),
+    }
+
+
+def _train_joint_all_steps(cfg: Dict[str, Any],
+                           nets: Sequence[nn.Module],
+                           A_buf_list: Sequence[torch.Tensor],
+                           dR_buf_list: Sequence[torch.Tensor],
+                           L: torch.Tensor,
+                           liab: torch.Tensor,
+                           device: torch.device,
+                           log: List[str]) -> List[float]:
+    """Train all time-indexed networks together using detached live TD targets.
+
+    The terminal LastStepPDIter is kept as a deterministic anchor.  Every global
+    optimizer step accumulates gradients for several/all dates and then performs
+    one optimizer update over all trainable networks.
+    """
+    T = int(cfg["TOTAL_STEPS"])
+    BUF = int(A_buf_list[0].shape[0])
+    if BUF < 2:
+        raise ValueError("BUFFER_SIZE must provide at least two samples for train/validation split.")
+
+    VAL_cfg = int(cfg.get("VAL_SAMPLES", max(1, BUF // 5)))
+    VAL = int(min(max(1, VAL_cfg), BUF - 1))
+    train_pool_idx = torch.arange(VAL, BUF, device=device)
+    val_idx = torch.arange(0, VAL, device=device)
+
+    psi_buf_list = _build_psi_buffers(cfg, A_buf_list, L, liab)
+
+    for i in range(T):
+        nets[i].train()
+    nets[-1].eval()
+
+    trainable_params = [p for i in range(T) for p in nets[i].parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters found in the time-indexed networks.")
+
+    opt_name = str(cfg.get("JOINT_OPTIMIZER", cfg.get("OPTIMIZER", "adam"))).lower().strip()
+    if opt_name == "adamw":
+        opt = torch.optim.AdamW(
+            trainable_params,
+            lr=float(cfg["LR_SMALL"]),
+            weight_decay=float(cfg.get("JOINT_WEIGHT_DECAY", cfg.get("WEIGHT_DECAY", 0.0))),
+        )
+    elif opt_name == "adam":
+        opt = torch.optim.Adam(trainable_params, lr=float(cfg["LR_SMALL"]))
+    else:
+        raise ValueError(f"Unknown optimizer {opt_name!r}; expected 'adam' or 'adamw'.")
+
+    MAX_EPOCHS = int(cfg["MAX_EPOCHS"])
+    if "JOINT_BATCH_SIZE" in cfg:
+        BATCH = int(cfg["JOINT_BATCH_SIZE"])
+    else:
+        BATCH = max(1, BUF // max(1, int(cfg["BATCH_FRACT"])))
+    BATCH = max(1, min(BATCH, train_pool_idx.numel()))
+    n_it = int(L.shape[0])
+
+    EVAL_EVERY = max(1, int(cfg.get("EVAL_EVERY", 1000)))
+    EVAL_PATIENCE = int(cfg.get("EVAL_PATIENCE", 10))
+    MIN_DELTA = float(cfg.get("EVAL_MIN_DELTA", 0.0))
+
+    best_score = float("inf")
+    best_state: Optional[List[Dict[str, torch.Tensor]]] = None
+    best_val: Optional[Dict[str, Any]] = None
+    eval_bad = 0
+    last_val: Optional[Dict[str, Any]] = None
+
+    start_time = time.time()
+    msg = (
+        f"[joint] training {T} networks together; BUFFER={BUF} VAL={VAL} BATCH/time={BATCH} "
+        f"times_per_step={cfg.get('JOINT_TIMES_PER_STEP', cfg.get('TIMES_PER_STEP', 'all'))}"
+    )
+    print(msg); log.append(msg)
+
+    bar = trange(MAX_EPOCHS, desc="joint TD", leave=False)
+    for ep in bar:
+        _apply_lr_schedule(opt, cfg, ep + 1)
+
+        selected_steps = _select_joint_steps(T, cfg, device)
+        if not selected_steps:
+            raise RuntimeError("No time steps selected for joint training.")
+
+        opt.zero_grad(set_to_none=True)
+        loss_vals: List[float] = []
+        mse_vals: List[float] = []
+        ce_vals: List[float] = []
+
+        # Accumulate gradients across dates, but delay optimizer.step().
+        # This avoids storing every date's autograd graph at once while keeping a
+        # synchronous joint update: parameters are unchanged until all date losses
+        # for this global step have backpropagated.
+        norm = float(len(selected_steps))
+        for step in selected_steps:
+            ridx = torch.randint(0, train_pool_idx.numel(), (BATCH,), device=device)
+            idx = train_pool_idx[ridx]
+            loss_t, metrics_t = _joint_loss_one_step(
+                cfg, nets, step, idx, A_buf_list, dR_buf_list, psi_buf_list, L, liab, n_it,
+            )
+            (loss_t / norm).backward()
+            loss_vals.append(float(loss_t.detach().item()))
+            mse_vals.append(float(metrics_t["mse"]))
+            ce_vals.append(float(metrics_t["ce"]))
+
+        torch.nn.utils.clip_grad_norm_(trainable_params, float(cfg.get("GRAD_CLIP", 1.0)))
+        opt.step()
+
+        if loss_vals:
+            bar.set_postfix(
+                loss=sum(loss_vals) / len(loss_vals),
+                mse=sum(mse_vals) / len(mse_vals),
+            )
+
+        should_eval = ((ep + 1) % EVAL_EVERY == 0) or ((ep + 1) == MAX_EPOCHS)
+        if should_eval:
+            for i in range(T):
+                nets[i].eval()
+            last_val = _validate_joint_td(
+                cfg, nets, A_buf_list, dR_buf_list, psi_buf_list, L, liab, device, val_idx,
+            )
+            for i in range(T):
+                nets[i].train()
+            nets[-1].eval()
+
+            score_kind = str(cfg.get("JOINT_EARLY_STOP_METRIC", "mean_mse")).lower().strip()
+            if score_kind in {"mean_plus_max_mse", "mean+max", "mean_max"}:
+                score = float(last_val["mean_mse"] + last_val["max_mse"])
+            elif score_kind == "max_mse":
+                score = float(last_val["max_mse"])
+            else:
+                score = float(last_val["mean_mse"])
+
+            msg = (
+                f"[eval joint] ep {ep + 1}: meanMSE={last_val['mean_mse']:.4e} "
+                f"maxMSE={last_val['max_mse']:.4e} meanCE={last_val['mean_ce']:.4e}"
+            )
+            print(msg); log.append(msg)
+
+            if score + MIN_DELTA < best_score:
+                best_score = score
+                best_state = [deepcopy(nets[i].state_dict()) for i in range(T)]
+                best_val = last_val
+                eval_bad = 0
+            else:
+                eval_bad += 1
+
+            if eval_bad >= EVAL_PATIENCE:
+                msg = f"[early stop joint] ep {ep + 1} (best score={best_score:.3e})"
+                print(msg); log.append(msg)
+                break
+
+    if best_state is not None:
+        for i in range(T):
+            nets[i].load_state_dict(best_state[i])
+        final_val = best_val if best_val is not None else last_val
+    else:
+        final_val = last_val
+
+    if final_val is None:
+        for i in range(T):
+            nets[i].eval()
+        final_val = _validate_joint_td(
+            cfg, nets, A_buf_list, dR_buf_list, psi_buf_list, L, liab, device, val_idx,
+        )
+
+    msg = f"[joint] finished in {(time.time() - start_time) / 60:.2f} min"
+    print(msg); log.append(msg)
+
+    # Keep the historical step_mse_list convention: reversed time order.
+    return [float(final_val["mse_by_step"][step]) for step in reversed(range(T))]
 
 # ----------------------------- training step --------------------------------
 def _train_one_step(cfg: Dict[str, Any],
@@ -463,22 +881,35 @@ def train_all_and_get_step0(cfg: Dict[str, Any],
         diag_dir = str(cfg["DIAG_DIR"])
     diag = TgtBufDiagnostics(output_dir=diag_dir) if diag_dir is not None else None
 
-    step_mse_list = []
-    for step in reversed(range(T)):
-        t0 = time.time()
-        A_buf = A_buf_list[step]
-        dR_buf = dR_buf_list[step]
+    fit_scheme = str(cfg.get("FIT_SCHEME", cfg.get("FITTING_SCHEME", "joint"))).lower().strip()
 
-        last_mse = _train_one_step(cfg, nets, step, A_buf, dR_buf, L, liab, device, log,
-                                   diag=diag)
+    if fit_scheme in {"backward", "sequential", "legacy", "one_by_one", "one-at-a-time"}:
+        # Legacy path retained for reproducibility.  The default is now the
+        # requested joint live-target TD fit below.
+        step_mse_list = []
+        for step in reversed(range(T)):
+            t0 = time.time()
+            A_buf = A_buf_list[step]
+            dR_buf = dR_buf_list[step]
 
-        if diag is not None:
-            csv_path = Path(diag_dir) / f"tgt_diag_step_{step}.csv"
-            diag.flush_step(step, csv_path)
+            last_mse = _train_one_step(cfg, nets, step, A_buf, dR_buf, L, liab, device, log,
+                                       diag=diag)
 
-        log.append(f"[step {step}] finished in {(time.time() - t0):.1f}s")
-        print(f"step {step} finished in {(time.time() - t0)/60:.2f} min")
-        step_mse_list.append(last_mse)
+            if diag is not None:
+                csv_path = Path(diag_dir) / f"tgt_diag_step_{step}.csv"
+                diag.flush_step(step, csv_path)
+
+            log.append(f"[step {step}] finished in {(time.time() - t0):.1f}s")
+            print(f"step {step} finished in {(time.time() - t0)/60:.2f} min")
+            step_mse_list.append(last_mse)
+    elif fit_scheme in {"joint", "together", "joint_online_td", "live_td"}:
+        step_mse_list = _train_joint_all_steps(
+            cfg, nets, A_buf_list, dR_buf_list, L, liab, device, log,
+        )
+    else:
+        raise ValueError(
+            f"Unknown FIT_SCHEME={fit_scheme!r}. Use 'joint'/'together' or 'backward'/'sequential'."
+        )
 
     step0 = nets[0].eval()
 
@@ -541,9 +972,10 @@ def sweep_correlation_warmstart(cfg_base: Dict[str, Any],
         ret = train_all_and_get_step0(cfg, work_dir=None, seed=seed + idx,
                                       prev_state_dicts=prev_states, return_all_states=True)
 
-        step0, log, states_this = ret
+        step0, log, states_this, step_mse_list = ret
         state0 = step0.state_dict()
         results[c] = {"state_dict": state0, "log": log, "seconds": time.time() - t0}
+        results[c]["step_mse"] = step_mse_list
 
         diag_A = cfg.get("DIAG_A_LIST", None)
         if diag_A is not None:
