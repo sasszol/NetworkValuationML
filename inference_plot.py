@@ -42,6 +42,8 @@ MODEL_DIR = "10_steps_3_DD_0_5_kL/five_banks_orig"  # folder with files like: st
 A_INPUT  = [2.0]            # scalar (broadcast) or length-n vector of A (distance-to-default)
 A_DEAD   = -4.0            # sentinel for “already-defaulted”; only used if your clearing uses a_dead
 kL = 0.5
+L_MATRIX = None            # optional custom exposure matrix (list[list[float]]), overrides kL
+LIAB_VECTOR = None         # optional custom liabilities; default = row sums of L_MATRIX
 # parameters that must match your training setup
 SIGMA = 1.0
 T_TOTAL = 1.0
@@ -282,6 +284,31 @@ def _broadcast_np(x: List[float], n: int, name: str) -> np.ndarray:
 
 
 @torch.no_grad()
+def _eval_L_liab(n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluation-time clearing matrices.
+
+    By default we mirror the original homogeneous complete-network setup
+    L_ij = kL/(n-1), i != j. If L_MATRIX is provided in the USER CONFIG
+    block, it is used verbatim so diagnostics can be run without any hidden
+    symmetry assumption.
+    """
+    if L_MATRIX is not None:
+        L = torch.as_tensor(L_MATRIX, dtype=torch.float32)
+        if tuple(L.shape) != (int(n), int(n)):
+            raise ValueError(f"L_MATRIX must have shape ({n}, {n}) (got {tuple(L.shape)}).")
+        if LIAB_VECTOR is not None:
+            liab = torch.as_tensor(LIAB_VECTOR, dtype=torch.float32)
+            if tuple(liab.shape) != (int(n),):
+                raise ValueError(f"LIAB_VECTOR must have shape ({n},) (got {tuple(liab.shape)}).")
+        else:
+            liab = L.sum(1)
+        return L, liab
+    L = build_L(n, offdiag=kL/(n-1))
+    liab = L.sum(1)
+    return L, liab
+
+
+@torch.no_grad()
 def predict_pd_postclearing(
     model: _PDInfer,
     A: torch.Tensor,  # (n,) or (B,n)
@@ -306,8 +333,7 @@ def predict_pd_postclearing(
 
     if L is None or liab is None:
         # training exposures/liabilities are built from L.sum(1)                 [sc_utils.build_matrices]
-        L = build_L(n, offdiag=kL/(n-1))
-        liab = L.sum(1)  # outside liabilities were merged into A in this ABM setup
+        L, liab = _eval_L_liab(n)  # outside liabilities were merged into A in this ABM setup
 
     # same time index as in diagnostics: residual horizon at this step
     T_now = max(float(T_total) - step * float(dt), 1e-8)
@@ -369,8 +395,7 @@ def plot_pd_vs_rho(
     A_vec = _broadcast_np(A_vals, n, "A")
 
     # Build clearing matrices once (ρ affects training dR, not L here)
-    L = build_L(n, offdiag=kL/(n-1))
-    liab = L.sum(1)
+    L, liab = _eval_L_liab(n)
 
     rhos: List[float] = []
     rows: List[np.ndarray] = []

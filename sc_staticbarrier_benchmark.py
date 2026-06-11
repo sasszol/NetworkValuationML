@@ -58,7 +58,10 @@ import numpy as np
 import torch
 
 from sc_core import hard_clear_pd
-from sc_utils import build_matrices, draw_shocks_factor, sample_A0_band
+from sc_utils import (
+    build_matrices, draw_shocks_factor, sample_A0_band,
+    infer_homogeneous_complete_ell,
+)
 
 
 # ----------------------------- math helpers -----------------------------
@@ -133,11 +136,12 @@ def sample_A0(cfg: Dict[str, Any], *, S: int, device: torch.device, rho: float) 
 # --------------------- blended Picard map (until convergence) ---------------------
 
 def _apply_L_sb(spay: torch.Tensor,
-                L: "torch.Tensor | None",
-                ell: "float | None") -> torch.Tensor:
-    """Compute spay @ L, optionally exploiting the symmetric rank-1 form.
+                L: torch.Tensor,
+                ell: Optional[float] = None) -> torch.Tensor:
+    """Compute incoming interbank payments ``spay @ L``.
 
-    Mirror of sc_core._apply_L; duplicated here to avoid a circular import.
+    When ``ell`` is supplied we use the exact homogeneous-complete-network
+    identity ``spay @ L = ell * (sum(spay) - spay)``.
     """
     if ell is not None:
         Sigma = spay.sum(dim=-1, keepdim=True)
@@ -149,14 +153,14 @@ def _apply_L_sb(spay: torch.Tensor,
 def projected_static_barrier_fp(
     A: torch.Tensor,  # (S,n)
     S_minus: torch.Tensor,  # (S,n) in {0,1}
-    L: "torch.Tensor | None",  # (n,n) or None when ell is provided
+    L: torch.Tensor,  # (n,n)
     liab: torch.Tensor,  # (n,)
     *,
     sigma: float,
     T_rem: float,
     tol: float = 1e-6,
     max_iters_guard: int = 20000,
-    ell: "float | None" = None,
+    ell: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """Blended fixed-point iteration used by the SDB benchmark.
 
@@ -166,9 +170,6 @@ def projected_static_barrier_fp(
         H(p)  = b - p L
         phi   = S^-(t) * [2 Φ((A-H)/σ√T_rem) - 1]
         p_new = phi if A + (phi L) - b >= 0 else 0
-
-    If `ell` is provided, the rank-1 form L = ell*(11^T - I) is used and the
-    `L` argument is ignored.
 
     Returns
     -------
@@ -217,23 +218,21 @@ def projected_static_barrier_fp(
 @torch.no_grad()
 def terminal_clearing(
     A: torch.Tensor,  # (S,n) at maturity
-    L: "torch.Tensor | None",
+    L: torch.Tensor,
     liab: torch.Tensor,
     *,
     a_dead: float,
     n_it: int,
-    ell: "float | None" = None,
+    ell: Optional[float] = None,
 ) -> torch.Tensor:
     """Deterministic terminal clearing (same logic as LastStepPDIter).
 
     Returned value is the survival indicator z in {0,1}^n (as float tensor).
 
     Implementation uses sc_core.hard_clear_pd with zero PDs ("pays in full").
-    If `ell` is provided, the rank-1 form of L is exploited inside.
     """
     pd0 = torch.zeros_like(A)
-    _pd_final, s = hard_clear_pd(pd0, A, L, liab, n_it=int(n_it), a_dead=float(a_dead),
-                                 ell=ell)
+    _pd_final, s = hard_clear_pd(pd0, A, L, liab, n_it=int(n_it), a_dead=float(a_dead), ell=ell)
     return s
 
 
@@ -261,7 +260,7 @@ def multistep_asset_buffers_sdb(
     liab: torch.Tensor,
     T_total: float,
     tol_fp: float = 1e-6,
-    ell: "float | None" = None,
+    ell: Optional[float] = None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
     """Generate a multi-step training buffer using the SDB (static-barrier) proxy.
 
@@ -379,10 +378,7 @@ def simulate_static_barrier_once(
 
     # Matrices exactly as in training
     L, liab = build_matrices(cfg, device)
-
-    # Optional rank-1 acceleration when the symmetric/homogeneous network is assumed
-    use_sym = bool(cfg.get("USE_SYMMETRIC_ASSUMPTION", False))
-    ell = (float(cfg.get("kL", 1.0)) / max(1, n - 1)) if use_sym else None
+    ell = infer_homogeneous_complete_ell(L)
 
     # Initial assets
     A = sample_A0(cfg, S=S, device=device, rho=float(rho))
@@ -462,12 +458,7 @@ def simulate_sc_data_once(
     S = int(S_override) if S_override is not None else int(cfg.get("VAL_SAMPLES", cfg.get("BUFFER_SIZE", 10000)))
 
     L, liab = build_matrices(cfg, device)
-
-    # Optional rank-1 acceleration when the symmetric/homogeneous network is assumed.
-    # Derived early so the data-generation overlay also benefits from the speedup.
-    use_sym = bool(cfg.get("USE_SYMMETRIC_ASSUMPTION", False))
-    ell = (float(cfg.get("kL", 1.0)) / max(1, n - 1)) if use_sym else None
-
+    ell = infer_homogeneous_complete_ell(L)
     A_path, dR_all, alive0 = build_rollout_paths(
         S,
         n,

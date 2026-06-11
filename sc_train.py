@@ -1,8 +1,8 @@
 # sc_train.py
-import math, time
+import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Iterable, Tuple, List, Any, Optional, Sequence
+from typing import Dict, Iterable, List, Any, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -10,63 +10,193 @@ from tqdm import trange
 
 from sc_core import (
     PDToMaturityNet, LastStepPDIter, approx_min_ce, squeeze_last,
-    hard_clear_pd, ste_clear_pd
+    hard_clear_pd, ste_clear_pd,
 )
-from sc_utils import build_matrices, iterative_breach_feature, draw_shocks_factor
+from sc_utils import (
+    build_matrices, iterative_breach_feature, draw_shocks_factor,
+    infer_homogeneous_complete_ell,
+)
 from sc_data import create_asset_buffer, make_dR_buffer, multistep_asset_buffers
 from sc_staticbarrier_benchmark import multistep_asset_buffers_sdb
 from sc_zero import ZeroSubModel
 from sc_diagnostics import TgtBufDiagnostics
 
 
-# -------------------------- symmetric-assumption helpers --------------------
+def _ell_from_L(L: torch.Tensor) -> Optional[float]:
+    """Return the common off-diagonal weight when L is homogeneous.
 
-def _sym_ell(cfg: Dict[str, Any], n: int) -> Optional[float]:
-    """Return the homogeneous off-diagonal exposure ell = kL/(n-1) when the
-    symmetric assumption is enabled in the config; otherwise None.
-
-    Returning a non-None ell switches all clearing primitives in sc_core/
-    sc_utils/sc_staticbarrier_benchmark to the rank-1 fast path.
+    This depends only on the fixed liability matrix, not on whether the current
+    realised asset vector is heterogeneous. If non-None, the rank-1 clearing
+    formulas are exact.
     """
-    if not bool(cfg.get("USE_SYMMETRIC_ASSUMPTION", False)):
-        return None
-    if n <= 1:
-        return None
-    return float(cfg.get("kL", 1.0)) / float(n - 1)
+    return infer_homogeneous_complete_ell(L)
 
-
-def _permute_per_scenario(*tensors: torch.Tensor) -> tuple:
-    """Apply an independent random permutation along the agent axis (-1) to
-    each scenario, jointly across all input tensors.
-
-    All inputs must share the same leading shape (B, n) — they may carry
-    additional trailing dims (e.g. (B, n, F)).
-    Returns the permuted tensors in the same order.
-    """
-    if len(tensors) == 0:
-        return tuple()
-    B, n = tensors[0].shape[0], tensors[0].shape[1]
-    device = tensors[0].device
-    perm = torch.argsort(torch.rand(B, n, device=device), dim=-1)  # (B, n)
-    out = []
-    for t in tensors:
-        if t.dim() == 2:
-            out.append(t.gather(dim=-1, index=perm))
-        else:
-            # gather along axis 1 with broadcast over trailing dims
-            idx = perm.unsqueeze(-1).expand(B, n, t.shape[-1])
-            out.append(t.gather(dim=1, index=idx))
-    return tuple(out)
 
 # -------------------------- helpers (MC replicas) ---------------------------
 
 def _k_mc_train(cfg: Dict[str, Any]) -> int:
-    """Single knob for ALL training sims (tgt0 + refresh + first)."""
+    """Single knob for all training-side teacher simulations."""
     return int(cfg.get("K_MC", cfg.get("K_MC_MAX", 1)))
 
+
 def _k_mc_valid(cfg: Dict[str, Any]) -> int:
-    """Separate knob for validation sims."""
+    """Separate knob for validation teacher simulations."""
     return int(cfg.get("K_MC_VALID", cfg.get("K_MC", 1)))
+
+
+def _mc_sim_max_rows(cfg: Dict[str, Any]) -> int:
+    """Maximum replicated rows processed in one teacher-simulation chunk."""
+    return max(1, int(cfg.get("MC_SIM_MAX_ROWS", 16384)))
+
+
+def _mc_replica_block(cfg: Dict[str, Any], k_total: int) -> int:
+    """Maximum number of MC replicas per scenario handled in one chunk."""
+    return max(1, min(int(k_total), int(cfg.get("MC_REPLICA_BLOCK", 32))))
+
+
+@torch.no_grad()
+def _postclear_pd_and_survival(nets,
+                               net_idx: int,
+                               A_state: torch.Tensor,
+                               L: torch.Tensor,
+                               liab: torch.Tensor,
+                               n_it: int,
+                               *,
+                               sigma: float,
+                               T_total: float,
+                               dt: float,
+                               k_surv_iters: int,
+                               a_dead: float,
+                               use_phi: bool,
+                               ell: Optional[float],
+                               psi_override: Optional[torch.Tensor] = None):
+    """Return post-clearing PDs and survivals for one time index.
+
+    ``psi_override`` lets callers reuse a precomputed ψ(A_t) for the current
+    step when the state is fixed across repeated evaluations. This is exact and
+    avoids recomputing the same feature for validation / MC teacher calls.
+    """
+    net = nets[net_idx]
+    if isinstance(net, LastStepPDIter):
+        x = A_state.unsqueeze(-1)
+    else:
+        if use_phi and getattr(net, "in_features_per_node", 1) >= 2:
+            psi = psi_override
+            if psi is None:
+                T_now = max(T_total - net_idx * dt, 1e-8)
+                psi = iterative_breach_feature(
+                    A_state, L, liab, sigma, T_now,
+                    k_surv_iters, a_dead, ell=ell,
+                )
+            x = torch.stack([A_state, psi], dim=-1)
+        else:
+            x = A_state.unsqueeze(-1)
+
+    logits = squeeze_last(net(x))
+    pd_raw = torch.sigmoid(logits)
+    return hard_clear_pd(pd_raw, A_state, L, liab, n_it, a_dead, ell=ell)
+
+
+@torch.no_grad()
+def _mc_average_td_target(cfg: Dict[str, Any],
+                          nets,
+                          step: int,
+                          A_base: torch.Tensor,
+                          L: torch.Tensor,
+                          liab: torch.Tensor,
+                          n_it: int,
+                          *,
+                          sigma: float,
+                          T_total: float,
+                          dt: float,
+                          k_surv_iters: int,
+                          a_dead: float,
+                          use_phi: bool,
+                          ell: Optional[float],
+                          k_mc_total: int,
+                          dR_single: Optional[torch.Tensor] = None,
+                          use_single_dR_when_k1: bool = True,
+                          psi_base: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Chunked Monte Carlo average of the TD teacher target.
+
+    This preserves the same estimator as the unchunked code but avoids
+    materialising the full ``(B * K_MC, n)`` replicated batch at once.
+
+    It also restores the *exact* pre-shock sharing across MC replicas: when the
+    same ``A_t`` is repeated K times, the time-t network evaluation and the
+    time-t clearing are identical across replicas because they do not depend on
+    ``dR_t``. That optimisation does **not** rely on any permutation or
+    homogeneity assumption; it only uses identical replicated inputs.
+    """
+    B, n = A_base.shape
+    K = max(1, int(k_mc_total))
+    rho = float(cfg["ASSET_CORR"])
+
+    if K == 1:
+        if use_single_dR_when_k1 and dR_single is not None:
+            dR_use = dR_single
+        else:
+            dR_use = draw_shocks_factor(B, n, rho, sigma, dt, device=A_base.device)
+
+        _, s_t = _postclear_pd_and_survival(
+            nets, step, A_base, L, liab, n_it,
+            sigma=sigma, T_total=T_total, dt=dt,
+            k_surv_iters=k_surv_iters, a_dead=a_dead,
+            use_phi=use_phi, ell=ell, psi_override=psi_base,
+        )
+        A_tp1 = torch.where(s_t > 0.5, A_base + dR_use, torch.full_like(A_base, float(a_dead)))
+        pd_tp1, _ = _postclear_pd_and_survival(
+            nets, step + 1, A_tp1, L, liab, n_it,
+            sigma=sigma, T_total=T_total, dt=dt,
+            k_surv_iters=k_surv_iters, a_dead=a_dead,
+            use_phi=use_phi, ell=ell, psi_override=None,
+        )
+        return (1.0 - s_t) + s_t * pd_tp1
+
+    max_rows = _mc_sim_max_rows(cfg)
+    rep_cap = _mc_replica_block(cfg, K)
+
+    accum = torch.zeros(B, n, device=A_base.device, dtype=A_base.dtype)
+    done = 0
+    while done < K:
+        k_blk = min(rep_cap, K - done)
+        base_blk = max(1, max_rows // k_blk)
+
+        for start in range(0, B, base_blk):
+            stop = min(start + base_blk, B)
+            A_chunk = A_base[start:stop]
+            psi_chunk = None if psi_base is None else psi_base[start:stop]
+
+            _, s_t = _postclear_pd_and_survival(
+                nets, step, A_chunk, L, liab, n_it,
+                sigma=sigma, T_total=T_total, dt=dt,
+                k_surv_iters=k_surv_iters, a_dead=a_dead,
+                use_phi=use_phi, ell=ell, psi_override=psi_chunk,
+            )
+
+            A_rep = A_chunk.repeat_interleave(k_blk, dim=0)
+            s_rep = s_t.repeat_interleave(k_blk, dim=0)
+            dR_rep = draw_shocks_factor(
+                A_rep.shape[0], n, rho, sigma, dt, device=A_rep.device,
+            )
+            A_tp1 = torch.where(
+                s_rep > 0.5,
+                A_rep + dR_rep,
+                torch.full_like(A_rep, float(a_dead)),
+            )
+
+            pd_tp1, _ = _postclear_pd_and_survival(
+                nets, step + 1, A_tp1, L, liab, n_it,
+                sigma=sigma, T_total=T_total, dt=dt,
+                k_surv_iters=k_surv_iters, a_dead=a_dead,
+                use_phi=use_phi, ell=ell, psi_override=None,
+            )
+            accum[start:stop] += (1.0 - s_t) * float(k_blk) + s_t * pd_tp1.view(stop - start, k_blk, n).sum(dim=1)
+
+        done += k_blk
+
+    return accum / float(K)
+
 
 # -------------------------- schedules (LR / refresh) ------------------------
 
@@ -82,6 +212,7 @@ def _scheduled_value(schedule: Optional[Dict[int, float]], default: float, epoch
             break
     return val
 
+
 def _apply_lr_schedule(opt: torch.optim.Optimizer, cfg: Dict[str, Any], epoch: int, *, key: str = "LR_SCHEDULE"):
     sched = cfg.get(key, None)
     base_lr = float(cfg["LR_SMALL"])
@@ -89,11 +220,14 @@ def _apply_lr_schedule(opt: torch.optim.Optimizer, cfg: Dict[str, Any], epoch: i
     for g in opt.param_groups:
         g["lr"] = lr
 
+
 def _refresh_every(cfg: Dict[str, Any], epoch: int) -> int:
     return int(_scheduled_value(cfg.get("REFRESH_EVERY_SCHEDULE", None), cfg["REFRESH_EVERY"], epoch))
 
+
 def _refresh_fract(cfg: Dict[str, Any], epoch: int) -> int:
     return int(_scheduled_value(cfg.get("REFRESH_FRACT_SCHEDULE", None), cfg["REFRESH_FRACT"], epoch))
+
 
 # ---------- teacher simulator: post-clearing at t and t+1 -------------------
 
@@ -102,7 +236,7 @@ def simulate_one_step_with_projection(nets,
                                       step: int,
                                       A_t: torch.Tensor,
                                       dR_t: torch.Tensor,
-                                      L: "torch.Tensor | None",
+                                      L: torch.Tensor,
                                       liab: torch.Tensor,
                                       n_it: int,
                                       *,
@@ -112,86 +246,44 @@ def simulate_one_step_with_projection(nets,
                                       k_surv_iters: int,
                                       a_dead: float,
                                       use_phi: bool,
-                                      ell: Optional[float] = None,
-                                      k_mc_share: int = 1):
+                                      ell: Optional[float] = None):
+    """Teacher: compute PD_t; clear at t; simulate t→t+1; compute PD_{t+1};
+    clear at t+1.
+
+    TD target:
+        (1 - S^+(t)) + S^+(t) * PD_post(t+1)
+
+    No post-shock symmetry shortcut is used here: once ``A_t`` is heterogeneous,
+    the teacher simulation keeps the full bank-level state.
     """
-    Teacher: compute PD_t; CLEAR at t; simulate t→t+1; compute PD_{t+1}; CLEAR at t+1.
-    TD target: (1 - S^+(t)) + S^+(t) * E[PD^{post}(t+1)].
+    pd_t, s_t = _postclear_pd_and_survival(
+        nets, step, A_t, L, liab, n_it,
+        sigma=sigma, T_total=T_total, dt=dt,
+        k_surv_iters=k_surv_iters, a_dead=a_dead,
+        use_phi=use_phi, ell=ell, psi_override=None,
+    )
 
-    If `ell` is provided, the rank-1 form of L is used in all clearing calls.
-
-    If `k_mc_share > 1`, the inputs `A_t` (and `dR_t`) must be ordered as
-    `repeat_interleave(K_MC, dim=0)` of B unique scenarios — i.e. the first
-    axis has length B*K_MC with K_MC consecutive replicas per scenario. The
-    pre-shock predictor evaluation and the time-t clearing (which depend only
-    on A_t, not on dR_t) are then computed ONCE per scenario and broadcast,
-    giving a ~K_MC × speed-up on that half of the work.
-    """
-    K = max(1, int(k_mc_share))
-
-    # --- step t (optionally shared across MC replicas)
-    if K > 1:
-        # extract the unique scenarios (one row per group of K consecutive replicas)
-        A_t_unique = A_t[::K].contiguous()       # (B_unique, n)
-        T_now = max(T_total - step * dt, 1e-8)
-        if use_phi:
-            psi_u = iterative_breach_feature(A_t_unique, L, liab, sigma, T_now,
-                                             k_surv_iters, a_dead, ell=ell)
-            inp_u = torch.stack([A_t_unique, psi_u], dim=-1)
-        else:
-            inp_u = A_t_unique.unsqueeze(-1)
-
-        logits_u = squeeze_last(nets[step](inp_u))
-        pd_t_raw_u = torch.sigmoid(logits_u)
-        pd_t_u, s_t_u = hard_clear_pd(pd_t_raw_u, A_t_unique, L, liab, n_it, a_dead, ell=ell)
-
-        # broadcast back across replicas
-        pd_t = pd_t_u.repeat_interleave(K, dim=0)
-        s_t = s_t_u.repeat_interleave(K, dim=0)
-    else:
-        T_now = max(T_total - step * dt, 1e-8)
-        if use_phi:
-            psi_t = iterative_breach_feature(A_t, L, liab, sigma, T_now,
-                                             k_surv_iters, a_dead, ell=ell)
-            inp_t = torch.stack([A_t, psi_t], dim=-1)
-        else:
-            inp_t = A_t.unsqueeze(-1)
-
-        logits_t = squeeze_last(nets[step](inp_t))
-        pd_t_raw = torch.sigmoid(logits_t)
-        pd_t, s_t = hard_clear_pd(pd_t_raw, A_t, L, liab, n_it, a_dead, ell=ell)
-
-    # --- advance assets with additive ABM; lock new defaults at a_dead
     A_next_free = A_t + dR_t
     A_tp1 = torch.where(s_t > 0.5, A_next_free, torch.full_like(A_t, float(a_dead)))
 
-    # --- step t+1
-    T_next = max(T_total - (step + 1) * dt, 1e-8)
-    next_net = nets[step + 1]
-    if isinstance(next_net, LastStepPDIter):
-        inp_tp1 = A_tp1.unsqueeze(-1)
-    else:
-        if getattr(next_net, "in_features_per_node", 1) >= 2:
-            psi_tp1 = iterative_breach_feature(A_tp1, L, liab, sigma, T_next,
-                                               k_surv_iters, a_dead, ell=ell)
-            inp_tp1 = torch.stack([A_tp1, psi_tp1], dim=-1)
-        else:
-            inp_tp1 = A_tp1.unsqueeze(-1)
+    pd_tp1, _ = _postclear_pd_and_survival(
+        nets, step + 1, A_tp1, L, liab, n_it,
+        sigma=sigma, T_total=T_total, dt=dt,
+        k_surv_iters=k_surv_iters, a_dead=a_dead,
+        use_phi=use_phi, ell=ell, psi_override=None,
+    )
 
-    logits_tp1 = squeeze_last(next_net(inp_tp1))
-    pd_tp1_raw = torch.sigmoid(logits_tp1)
-    pd_tp1, _ = hard_clear_pd(pd_tp1_raw, A_tp1, L, liab, n_it, a_dead, ell=ell)
-
-    tgt = (1. - s_t) + s_t * pd_tp1
+    tgt = (1.0 - s_t) + s_t * pd_tp1
     return pd_t, tgt, s_t
+
 
 # ------------------------------ diagnostics ---------------------------------
 
 @torch.no_grad()
 def _diag_print_step0(step0: nn.Module, cfg: Dict[str, Any], A_list: Sequence[float]) -> None:
     """
-    Print the post‑clearing PDs of the trained step‑0 net at chosen A.
-    Uses the *same* ψ and hard‑clearing as training (fully consistent).
+    Print the post-clearing PDs of the trained step-0 net at chosen A.
+    Uses the same ψ feature and hard-clearing map as training.
     """
     device = next(step0.parameters()).device
     n = int(cfg["N_BANKS"])
@@ -209,7 +301,8 @@ def _diag_print_step0(step0: nn.Module, cfg: Dict[str, Any], A_list: Sequence[fl
     else:
         raise ValueError(f"DIAG_A_LIST must be length 1 or {n} (got {len(A_list)})")
 
-    ell = _sym_ell(cfg, n)
+    ell = _ell_from_L(L)
+
     if use_phi and getattr(step0, "in_features_per_node", 1) >= 2:
         psi = iterative_breach_feature(A, L, liab, sigma=sigma, T=T_now,
                                        k=k_phi, a_dead=a_dead, ell=ell)
@@ -223,8 +316,9 @@ def _diag_print_step0(step0: nn.Module, cfg: Dict[str, Any], A_list: Sequence[fl
 
     arr = pd_post.squeeze(0).detach().cpu().numpy()
     msg = (f"[diag] corr={cfg['ASSET_CORR']:.4f}  A={list(A_list)}  "
-           f"post‑clear PD mean={arr.mean():.4f}")
+           f"post-clear PD mean={arr.mean():.4f}")
     print(msg)
+
 
 def np_round(x, k: int = 4):
     try:
@@ -233,30 +327,29 @@ def np_round(x, k: int = 4):
     except Exception:
         return x
 
+
 # ----------------------------- training step --------------------------------
+
 def _train_one_step(cfg: Dict[str, Any],
                     nets, step: int,
                     A_buf, dR_buf,
                     L, liab,
                     device: torch.device,
                     log: List[str],
-                    diag: "TgtBufDiagnostics | None" = None) -> None:
+                    diag: "TgtBufDiagnostics | None" = None) -> float:
 
-    net = nets[step]; net.train()
+    net = nets[step]
+    net.train()
     opt = torch.optim.Adam(net.parameters(), lr=float(cfg["LR_SMALL"]))
     bce_elem = nn.BCELoss(reduction="none")
     mse = nn.MSELoss()
 
     n_it = int(L.shape[0])
+    ell = _ell_from_L(L)
     use_ste = bool(cfg.get("USE_STE_CLEARING", True))
     a_dead = float(cfg.get("A_DEAD", -10.0))
     use_phi = bool(cfg.get("USE_PHI_FEATURE", True))
     mask_surv = bool(cfg.get("MASK_LOSS_TO_SURVIVORS", True))
-
-    n = int(cfg["N_BANKS"])
-    use_sym = bool(cfg.get("USE_SYMMETRIC_ASSUMPTION", False))
-    ell = _sym_ell(cfg, n)
-
     BUF = int(cfg["BUFFER_SIZE"])
     VAL = int(min(cfg.get("VAL_SAMPLES", BUF // 5), BUF))
     train_pool_idx = torch.arange(VAL, BUF, device=device)
@@ -278,33 +371,18 @@ def _train_one_step(cfg: Dict[str, Any],
         else:
             nets_for_tgt0 = nets
 
-        k_mc = _k_mc_train(cfg)
-        if k_mc > 1:
-            A_rep  = A_buf.repeat_interleave(k_mc, dim=0)
-            rho = float(cfg["ASSET_CORR"])
-            dR_rep = draw_shocks_factor(A_rep.shape[0], A_rep.shape[1],
-                                        rho, cfg["SIGMA"], cfg["DT"], device=A_rep.device)
-            _, td_many, s_now = simulate_one_step_with_projection(
-                nets_for_tgt0, step, A_rep, dR_rep,
-                L, liab, n_it,
-                sigma=cfg["SIGMA"], T_total=cfg["T_TOTAL"],
-                dt=cfg["DT"], k_surv_iters=k_phi,
-                a_dead=a_dead, use_phi=use_phi,
-                ell=ell,
-                k_mc_share=(k_mc if use_sym else 1),
-            )
-            tgt0 = td_many.view(-1, k_mc, n).mean(dim=1)
-        else:
-            _, tgt0, s_now = simulate_one_step_with_projection(
-                nets_for_tgt0, step, A_buf, dR_buf,
-                L, liab, n_it,
-                sigma=cfg["SIGMA"], T_total=cfg["T_TOTAL"],
-                dt=cfg["DT"], k_surv_iters=k_phi,
-                a_dead=a_dead, use_phi=use_phi,
-                ell=ell,
-                k_mc_share=1,
-            )
-    tgt_buf = tgt0.detach().clamp_(0., 1.)
+        tgt0 = _mc_average_td_target(
+            cfg, nets_for_tgt0, step, A_buf, L, liab, n_it,
+            sigma=cfg["SIGMA"], T_total=cfg["T_TOTAL"],
+            dt=cfg["DT"], k_surv_iters=k_phi,
+            a_dead=a_dead, use_phi=use_phi,
+            ell=ell,
+            k_mc_total=_k_mc_train(cfg),
+            dR_single=dR_buf,
+            use_single_dR_when_k1=True,
+            psi_base=psi_buf,
+        )
+    tgt_buf = tgt0.detach().clamp_(0.0, 1.0)
 
     if diag is not None:
         diag.record(step, epoch=0, tgt_buf=tgt_buf)
@@ -312,35 +390,23 @@ def _train_one_step(cfg: Dict[str, Any],
     best_val_mse = float("inf")
     best_state = None
     eval_bad = 0
-    EVAL_PATIENCE = int(cfg.get("EVAL_PATIENCE", 10))
-    MIN_DELTA = float(cfg.get("EVAL_MIN_DELTA", 0.0))
 
     last_refresh_epoch = -10**9
     next_eval_epoch = int(cfg.get("EVAL_EVERY", 1000))
-    MAX_EPOCHS = int(cfg["MAX_EPOCHS"])
-    BATCH = max(1, int(cfg["BUFFER_SIZE"] // max(1, int(cfg["BATCH_FRACT"]))))
+    max_epochs = int(cfg["MAX_EPOCHS"])
+    batch = max(1, int(cfg["BUFFER_SIZE"] // max(1, int(cfg["BATCH_FRACT"]))))
 
-    bar = trange(MAX_EPOCHS, desc=f"step {step}", leave=False)
+    bar = trange(max_epochs, desc=f"step {step}", leave=False)
 
     for ep in bar:
         _apply_lr_schedule(opt, cfg, ep + 1)
         refresh_every = _refresh_every(cfg, ep + 1)
 
-        ridx = torch.randint(0, train_pool_idx.numel(), (BATCH,), device=device)
+        ridx = torch.randint(0, train_pool_idx.numel(), (batch,), device=device)
         idx = train_pool_idx[ridx]
         A_b = A_buf[idx]
         tgt_b = tgt_buf[idx]
         psi_b = psi_buf[idx] if use_phi else None
-
-        # Permutation augmentation under the symmetric assumption (Option B1).
-        # Joint random S_n permutation per scenario applied to (A, psi, target).
-        # Loss is invariant under joint relabelling; this helps the flat MLP
-        # learn the invariance from data, and is a no-op for DeepSets.
-        if use_sym:
-            if use_phi:
-                A_b, psi_b, tgt_b = _permute_per_scenario(A_b, psi_b, tgt_b)
-            else:
-                A_b, tgt_b = _permute_per_scenario(A_b, tgt_b)
 
         opt.zero_grad(set_to_none=True)
         if use_phi:
@@ -371,7 +437,6 @@ def _train_one_step(cfg: Dict[str, Any],
         torch.nn.utils.clip_grad_norm_(net.parameters(), cfg["GRAD_CLIP"])
         opt.step()
 
-        # refresh teacher targets
         if (ep + 1) % int(refresh_every) == 0:
             with torch.no_grad():
                 sel_train = train_pool_idx[
@@ -379,34 +444,17 @@ def _train_one_step(cfg: Dict[str, Any],
                         : max(1, train_pool_idx.numel() // max(1, int(_refresh_fract(cfg, ep + 1))))
                     ]
                 ]
-                k_mc = _k_mc_train(cfg)
-                if k_mc > 1:
-                    A_rep  = A_buf[sel_train].repeat_interleave(k_mc, dim=0)
-                    rho = float(cfg["ASSET_CORR"])
-                    dR_rep = draw_shocks_factor(A_rep.shape[0], A_rep.shape[1],
-                                                rho, cfg["SIGMA"], cfg["DT"], device=A_rep.device)
-                    _, td_many, _ = simulate_one_step_with_projection(
-                        nets, step, A_rep, dR_rep,
-                        L, liab, n_it,
-                        sigma=cfg["SIGMA"], T_total=cfg["T_TOTAL"],
-                        dt=cfg["DT"], k_surv_iters=k_phi,
-                        a_dead=a_dead, use_phi=use_phi,
-                        ell=ell,
-                        k_mc_share=(k_mc if use_sym else 1),
-                    )
-                    tgt_buf[sel_train] = td_many.view(-1, k_mc, int(cfg["N_BANKS"])).mean(dim=1)
-                else:
-                    _, td_once, _ = simulate_one_step_with_projection(
-                        nets, step,
-                        A_buf[sel_train], dR_buf[sel_train],
-                        L, liab, n_it,
-                        sigma=cfg["SIGMA"], T_total=cfg["T_TOTAL"],
-                        dt=cfg["DT"], k_surv_iters=k_phi,
-                        a_dead=a_dead, use_phi=use_phi,
-                        ell=ell,
-                        k_mc_share=1,
-                    )
-                    tgt_buf[sel_train] = td_once
+                tgt_buf[sel_train] = _mc_average_td_target(
+                    cfg, nets, step, A_buf[sel_train], L, liab, n_it,
+                    sigma=cfg["SIGMA"], T_total=cfg["T_TOTAL"],
+                    dt=cfg["DT"], k_surv_iters=k_phi,
+                    a_dead=a_dead, use_phi=use_phi,
+                    ell=ell,
+                    k_mc_total=_k_mc_train(cfg),
+                    dR_single=dR_buf[sel_train],
+                    use_single_dR_when_k1=True,
+                    psi_base=(psi_buf[sel_train] if psi_buf is not None else None),
+                )
 
             last_refresh_epoch = ep + 1
 
@@ -418,11 +466,7 @@ def _train_one_step(cfg: Dict[str, Any],
         if should_eval:
             with torch.no_grad():
                 if use_phi:
-                    psi_val = iterative_breach_feature(A_buf[val_idx], L, liab,
-                                                       sigma=cfg["SIGMA"],
-                                                       T=max(cfg["T_TOTAL"] - step * cfg["DT"], 1e-8),
-                                                       k=k_phi, a_dead=a_dead, ell=ell)
-                    x_v = torch.stack([A_buf[val_idx], psi_val], dim=-1)
+                    x_v = torch.stack([A_buf[val_idx], psi_buf[val_idx]], dim=-1)
                 else:
                     x_v = A_buf[val_idx].unsqueeze(-1)
 
@@ -431,29 +475,26 @@ def _train_one_step(cfg: Dict[str, Any],
                 pd_pred_v, _ = hard_clear_pd(pd_raw_v, A_buf[val_idx], L, liab,
                                              n_it, a_dead, ell=ell)
 
-                k_mc_v = _k_mc_valid(cfg)
-                A_rep  = A_buf[val_idx].repeat_interleave(k_mc_v, dim=0)
-                rho = float(cfg["ASSET_CORR"])
-                dR_rep = draw_shocks_factor(A_rep.shape[0], A_rep.shape[1],
-                                            rho, cfg["SIGMA"], cfg["DT"], device=A_rep.device)
-                _, td_many, _ = simulate_one_step_with_projection(
-                    nets, step, A_rep, dR_rep,
-                    L, liab, n_it,
+                true_v = _mc_average_td_target(
+                    cfg, nets, step, A_buf[val_idx], L, liab, n_it,
                     sigma=cfg["SIGMA"], T_total=cfg["T_TOTAL"],
                     dt=cfg["DT"], k_surv_iters=k_phi,
                     a_dead=a_dead, use_phi=use_phi,
                     ell=ell,
-                    k_mc_share=(k_mc_v if use_sym else 1),
+                    k_mc_total=_k_mc_valid(cfg),
+                    dR_single=None,
+                    use_single_dR_when_k1=False,
+                    psi_base=(psi_buf[val_idx] if psi_buf is not None else None),
                 )
-                true_v = td_many.view(-1, k_mc_v, int(cfg["N_BANKS"])).mean(dim=1)
 
                 val_mse = mse(pd_pred_v, true_v).item()
-                val_ce  = nn.BCELoss()(pd_pred_v, true_v).item()
-                ce_min  = approx_min_ce(true_v)
+                val_ce = nn.BCELoss()(pd_pred_v, true_v).item()
+                ce_min = approx_min_ce(true_v)
 
                 msg = (f"[eval] step {step} ep {ep + 1}: "
                        f"MSE={val_mse:.4e}  CE={val_ce:.4e}  minCE≈{ce_min:.4e}")
-                print(msg); log.append(msg)
+                print(msg)
+                log.append(msg)
 
                 next_eval_epoch = (ep + 1) + int(cfg["EVAL_EVERY"])
 
@@ -474,16 +515,18 @@ def _train_one_step(cfg: Dict[str, Any],
 
     return best_val_mse
 
+
 # ----------------------------- public APIs ----------------------------------
+
 def train_all_and_get_step0(cfg: Dict[str, Any],
                             work_dir=None,
                             seed: int = 10,
                             *,
                             prev_state_dicts: Optional[List[Dict[str, Any]]] = None,
-                            return_all_states: bool = False
-                            ) -> Tuple[nn.Module, List[str]] | Tuple[nn.Module, List[str], List[Dict[str, Any]]]:
+                            return_all_states: bool = False):
     torch.manual_seed(seed)
-    import numpy as _np; _np.random.seed(seed)
+    import numpy as _np
+    _np.random.seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n = int(cfg["N_BANKS"])
@@ -491,13 +534,11 @@ def train_all_and_get_step0(cfg: Dict[str, Any],
     dt = float(cfg["DT"])
 
     L, liab = build_matrices(cfg, device)
+    ell = _ell_from_L(L)
 
     use_phi = bool(cfg.get("USE_PHI_FEATURE", True))
     in_F = 1 + int(use_phi)
-
     use_deepsets = bool(cfg.get("USE_DEEPSETS", False))
-    ell = _sym_ell(cfg, n)
-
     nets = [PDToMaturityNet(n, in_features_per_node=in_F,
                             use_deepsets=use_deepsets).to(device)
             for _ in range(T)]
@@ -511,12 +552,11 @@ def train_all_and_get_step0(cfg: Dict[str, Any],
 
     log: List[str] = []
 
-    # --------- NEW: build path‑consistent per‑step buffers ----------
     if bool(cfg.get("USE_ROLLOUT_PATHS", True)):
         buf_method = str(cfg.get("NAIVE_PATHS_METHOD", "sc_data")).lower().strip()
 
         if buf_method in {"sc_data", "rollout", "rollout_paths"}:
-            A_buf_list, dR_buf_list, alive_paths = multistep_asset_buffers(
+            A_buf_list, dR_buf_list, _alive_paths = multistep_asset_buffers(
                 S=cfg["BUFFER_SIZE"], n=n, T=T, dt=dt, device=device,
                 init_dd=cfg.get("INIT_DD", 1.0), sigma=cfg["SIGMA"], rho=cfg["ASSET_CORR"],
                 a_dead=cfg.get("A_DEAD", -10.0),
@@ -536,10 +576,7 @@ def train_all_and_get_step0(cfg: Dict[str, Any],
             )
 
         elif buf_method in {"static_barrier", "sdb", "static"}:
-            # SDB (state-dependent static-barrier) buffer generator.
-            # This uses the same network revaluation / projection dynamics as training,
-            # but replaces the neural PD predictor by the ABM flat-barrier proxy.
-            A_buf_list, dR_buf_list, alive_paths = multistep_asset_buffers_sdb(
+            A_buf_list, dR_buf_list, _alive_paths = multistep_asset_buffers_sdb(
                 S=cfg["BUFFER_SIZE"], n=n, T=T, dt=dt, device=device,
                 init_dd=cfg.get("INIT_DD", 1.0), sigma=cfg["SIGMA"], rho=cfg["ASSET_CORR"],
                 a_dead=cfg.get("A_DEAD", -10.0),
@@ -561,8 +598,6 @@ def train_all_and_get_step0(cfg: Dict[str, Any],
             )
 
     else:
-        # Fallback: old behaviour, per‑step independent buffers
-
         dR_buf = make_dR_buffer(cfg["BUFFER_SIZE"], n, cfg["ASSET_CORR"],
                                 sigma=cfg["SIGMA"], dt=cfg["DT"], device=device)
         A_buf_list = []
@@ -576,7 +611,7 @@ def train_all_and_get_step0(cfg: Dict[str, Any],
                                         a_dead=cfg.get("A_DEAD", -10.0), seed=seed)
             A_buf_list.append(A_buf)
             dR_buf_list.append(dR_buf)
-    # ---------- diagnostics logger ----------
+
     diag_dir = None
     if work_dir is not None:
         diag_dir = str(Path(work_dir) / "diag")
@@ -610,8 +645,8 @@ def train_all_and_get_step0(cfg: Dict[str, Any],
     if return_all_states:
         all_states = [nets[i].state_dict() for i in range(T)]
         return step0, log, all_states, step_mse_list
-    else:
-        return step0, log, step_mse_list
+    return step0, log, step_mse_list
+
 
 def sweep_correlation(cfg_base: Dict[str, Any],
                       corr_values: Iterable[float],
@@ -645,12 +680,12 @@ def sweep_correlation(cfg_base: Dict[str, Any],
             torch.save(state_for_disk, out)
     return results
 
+
 def sweep_correlation_warmstart(cfg_base: Dict[str, Any],
                                 corr_values: Iterable[float],
                                 save_dir: str | None = None,
                                 seed: int = 10) -> Dict[float, Dict[str, Any]]:
     results: Dict[float, Dict[str, Any]] = {}
-
     prev_states: Optional[List[Dict[str, Any]]] = None
 
     for idx, c in enumerate(corr_values):
@@ -659,12 +694,21 @@ def sweep_correlation_warmstart(cfg_base: Dict[str, Any],
         print(f"[sweep (warm-start)] corr={c:.4f}")
         t0 = time.time()
 
-        ret = train_all_and_get_step0(cfg, work_dir=None, seed=seed + idx,
-                                      prev_state_dicts=prev_states, return_all_states=True)
+        step0, log, states_this, step_mse_list = train_all_and_get_step0(
+            cfg,
+            work_dir=None,
+            seed=seed + idx,
+            prev_state_dicts=prev_states,
+            return_all_states=True,
+        )
 
-        step0, log, states_this = ret
         state0 = step0.state_dict()
-        results[c] = {"state_dict": state0, "log": log, "seconds": time.time() - t0}
+        results[c] = {
+            "state_dict": state0,
+            "log": log,
+            "seconds": time.time() - t0,
+            "step_mse": step_mse_list,
+        }
 
         diag_A = cfg.get("DIAG_A_LIST", None)
         if diag_A is not None:
@@ -674,7 +718,9 @@ def sweep_correlation_warmstart(cfg_base: Dict[str, Any],
             tag = f"{c:.4f}"
             out = Path(save_dir) / f"step0_corr_{tag}.pt"
             out.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(state0, out)
+            state_for_disk = dict(state0)
+            state_for_disk["mse_vec"] = torch.tensor(step_mse_list, dtype=torch.float32)
+            torch.save(state_for_disk, out)
 
         prev_states = states_this
 

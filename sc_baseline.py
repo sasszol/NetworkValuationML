@@ -34,7 +34,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import numpy as np
 import torch
 
-from sc_utils import build_matrices, iterative_breach_feature
+from sc_utils import build_matrices, iterative_breach_feature, infer_homogeneous_complete_ell
 from sc_data import build_rollout_paths, apply_extra_defaults_per_step
 
 
@@ -222,12 +222,7 @@ def baseline_from_generator(
 
     # -------- network matrices (needed only for overlay / psi) ---------------
     L, liab = build_matrices(cfg, device)
-
-    # Optional rank-1 acceleration when the symmetric/homogeneous network is assumed.
-    # Derived once and forwarded to every clearing-related primitive below so that
-    # the overlay path and the t=0 ψ diagnostic both see the speedup.
-    use_sym = bool(cfg.get("USE_SYMMETRIC_ASSUMPTION", False))
-    ell = (float(cfg.get("kL", 1.0)) / max(1, n - 1)) if use_sym else None
+    ell = infer_homogeneous_complete_ell(L)
 
     # -------- base ABM + Brownian-bridge barrier defaults --------------------
     A_path, dR_all, alive0 = build_rollout_paths(
