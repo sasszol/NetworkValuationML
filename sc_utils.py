@@ -44,29 +44,50 @@ def infer_homogeneous_complete_ell(
 
 
 def build_matrices(cfg: Dict[str, Any], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build the hard-coded homogeneous fully connected liability matrix.
+    """Build the interbank exposure matrix and implied liabilities.
 
     Returns
     -------
     (L, liab)
-      L    : (n,n) exposure matrix with diag=0 and offdiag=kL/(n-1)
-      liab : (n,)  interbank liabilities, i.e. row sums of L
+      L    : (n,n) exposure matrix
+      liab : (n,)  interbank liabilities
+
+    Behaviour
+    ---------
+    * If ``cfg["L_MATRIX"]`` is provided, it is used verbatim. This allows
+      asymmetric / heterogeneous network structures without touching the rest of
+      the codebase.
+    * Otherwise we fall back to the paper's homogeneous fully-connected default
+      ``L_ij = kL/(n-1)`` for ``i != j`` and ``L_ii = 0``.
 
     Notes
     -----
-    The benchmark currently keeps the *network* symmetry hard-coded:
-    ``L_ij = kL / (n - 1)`` for ``i != j`` and ``L_ii = 0``. This does not
-    imply homogeneous realised asset states after the simulation starts.
-
     Outside liabilities are assumed to be absorbed into the external asset
     variable A ("distance-to-default") at t=0.
     """
     n = int(cfg["N_BANKS"])
-    kL = float(cfg.get("kL", 1.0))
 
     if n <= 1:
         raise ValueError(f"N_BANKS must be >= 2 (got {n}).")
 
+    if cfg.get("L_MATRIX", None) is not None:
+        L = torch.as_tensor(cfg["L_MATRIX"], dtype=torch.float32, device=device)
+        if L.shape != (n, n):
+            raise ValueError(
+                f"L_MATRIX must have shape ({n}, {n}) (got {tuple(L.shape)})."
+            )
+        liab_cfg = cfg.get("LIAB_VECTOR", None)
+        if liab_cfg is not None:
+            liab = torch.as_tensor(liab_cfg, dtype=torch.float32, device=device)
+            if liab.shape != (n,):
+                raise ValueError(
+                    f"LIAB_VECTOR must have shape ({n},) (got {tuple(liab.shape)})."
+                )
+        else:
+            liab = L.sum(1)
+        return L, liab
+
+    kL = float(cfg.get("kL", 1.0))
     L = build_L(n, offdiag=kL / (n - 1))
     liab = L.sum(1)
     return L.to(device), liab.to(device)
@@ -185,12 +206,11 @@ def _survival_abm(
 
 
 def _apply_L_util(spay: torch.Tensor,
-                  L: torch.Tensor,
-                  ell: float | None = None) -> torch.Tensor:
-    """Compute incoming interbank payments ``spay @ L``.
+                  L: "torch.Tensor | None",
+                  ell: "float | None") -> torch.Tensor:
+    """Compute spay @ L, optionally exploiting the symmetric rank-1 form.
 
-    When ``ell`` is supplied we use the exact homogeneous-complete-network
-    identity ``spay @ L = ell * (sum(spay) - spay)``.
+    Mirror of sc_core._apply_L; duplicated here to avoid a circular import.
     """
     if ell is not None:
         Sigma = spay.sum(dim=-1, keepdim=True)
@@ -201,7 +221,7 @@ def _apply_L_util(spay: torch.Tensor,
 @torch.no_grad()
 def iterative_survival_feature(
     A: torch.Tensor,
-    L: torch.Tensor,
+    L: "torch.Tensor | None",
     liab: torch.Tensor,
     sigma: float,
     T: float,
@@ -209,11 +229,14 @@ def iterative_survival_feature(
     a_dead: float = -10.0,
     eps: float = 1e-8,
     *,
-    ell: float | None = None,
+    ell: "float | None" = None,
 ) -> torch.Tensor:
     """Counterparty-aware survival phi via fixed point on expected payments.
 
     Alive is inferred from assets via the sentinel: A > a_dead.
+
+    If `ell` is provided, uses the symmetric rank-1 form of L
+    (L = ell*(11^T - I)); `L` may then be passed as None.
     """
     liab_row = liab.unsqueeze(0)
     S = (A > (float(a_dead) + eps)).float()
@@ -235,7 +258,7 @@ def iterative_survival_feature(
 @torch.no_grad()
 def iterative_breach_feature(
     A: torch.Tensor,
-    L: torch.Tensor,
+    L: "torch.Tensor | None",
     liab: torch.Tensor,
     sigma: float,
     T: float,
@@ -243,7 +266,7 @@ def iterative_breach_feature(
     a_dead: float = -10.0,
     eps: float = 1e-8,
     *,
-    ell: float | None = None,
+    ell: "float | None" = None,
 ) -> torch.Tensor:
     """Barrier breach probability psi = 1 - phi_survival (ABM, iterated)."""
     surv = iterative_survival_feature(A, L, liab, sigma, T, k, a_dead, eps, ell=ell)

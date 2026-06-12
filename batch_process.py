@@ -9,7 +9,7 @@ This file is used in two ways:
 Key switches
 ------------
 NAIVE_PATHS_METHOD
-  Controls which naive multi-step buffer generator is used when
+  Controls which *naive multi-step buffer generator* is used when
   USE_ROLLOUT_PATHS=True in sc_train:
 
     - "sc_data"         : rollout sampler from sc_data (Brownian-bridge
@@ -17,23 +17,47 @@ NAIVE_PATHS_METHOD
     - "static_barrier"  : SDB benchmark buffer generator (Picard fixed-point
                            + projection each step)
 
-USE_DEEPSETS
-  False -> original flat MLP predictor.
-  True  -> DeepSets predictor (permutation-equivariant architecture).
+  The same value can also be used as the sweep method when running this file
+  as a script.
 
-Important modelling note
-------------------------
-We keep the *initial / structural* homogeneous-complete network assumptions of
-the benchmark setup (equal off-diagonal L, common initial setup, one-factor
-asset shocks). But we do NOT apply any post-shock/pathwise symmetrisation once
-assets become heterogeneous.
+USE_DEEPSETS  (architecture switch)
+  False -> use the original BaseMLP predictor (Flatten -> 64 -> 64 -> 32 -> N).
+  True  -> use the DeepSets predictor (permutation-equivariant by construction;
+           parameter count independent of N; supports zero-shot transfer to
+           other N values). See deepsets_vs_mlp.tex for the full discussion.
 
-Concretely:
-  * The old data-side permutation augmentation / pathwise symmetrisation is not
-    used.
-  * Full bank-level clearing / ψ evaluation is retained after shocks.
-  * Chunked MC target evaluation is used to avoid CUDA OOM during training /
-    validation without changing the estimator.
+USE_SYMMETRIC_ASSUMPTION  (computational switch; valid iff the homogeneous
+                            symmetric network of the paper's Assumption is in
+                            force, i.e. L_ij = kL/(N-1) off-diagonal, b_i =
+                            kL, common a_0).
+  When True, the following optimisations are enabled jointly:
+
+    * Layer-1 rank-1 / diagonal factorisation of L in every clearing-related
+      primitive (hard_clear_pd, ste_clear_pd, LastStepPDIter,
+      projected_static_barrier_fp, iterative_survival_feature). Brings the
+      per-scenario clearing cost from O(N^3) to O(N^2). Numerics are exact
+      up to floating-point ordering.
+
+    * Layer-4 sharing of the "pre-shock" time-t clearing across MC replicas
+      inside simulate_one_step_with_projection: replicas of the same scenario
+      share the same A_t, hence the same pd_t / s_t.
+
+    * Option B (data-side symmetrisation):
+        - permutation augmentation of training batches (joint S_n permutation
+          of A, psi, target). For a non-equivariant predictor this teaches the
+          symmetry directly from data and improves sample efficiency, so
+          fewer K_MC may be sufficient at the same target MSE.
+
+  Note: an earlier draft also collapsed per-agent TD targets to the
+  within-scenario mean over alive agents ("Rao-Blackwell"). That step was
+  removed because it is biased: under the symmetric assumption the joint law
+  of A_t is exchangeable, but a single realisation is heterogeneous from t>0
+  onward (different idiosyncratic shocks per bank), so each per-agent target
+  estimates a different conditional expectation and pathwise averaging biases
+  the TD target.
+
+  The two flags are independent: you may enable the architecture refactor
+  without the symmetric-assumption optimisations and vice versa.
 """
 
 import numpy as np
@@ -59,8 +83,11 @@ CFG = dict(
     # MC knobs
     K_MC=50,
     K_MC_VALID=2_000,
-    MC_SIM_MAX_ROWS=16_384,   # max replicated rows per teacher/validation chunk
-    MC_REPLICA_BLOCK=32,      # max MC replicas per chunk
+    # Memory-control knobs for teacher / validation MC simulation.
+    # They do NOT change the estimator; they only chunk the replicated
+    # `(buffer * K_MC, ...)` simulation so it fits on smaller GPUs.
+    MC_SIM_MAX_ROWS=32_768,
+    MC_REPLICA_BLOCK=8,
 
     BATCH_FRACT=1,
 
@@ -70,12 +97,12 @@ CFG = dict(
     REFRESH_EVERY_SCHEDULE={0: 40},
     REFRESH_FRACT_SCHEDULE={0: 1},
 
-    MAX_EPOCHS=4_000,
+    MAX_EPOCHS=2_000,
     LR_SMALL=2e-4,
-    LR_SCHEDULE={0: 6e-4, 4_000: 1e-4, 7_000: 6e-5},
+    LR_SCHEDULE={0: 7e-4, 4_000: 5e-4, 7_000: 2e-4},
     GRAD_CLIP=1.0,
 
-    EVAL_EVERY=4000,
+    EVAL_EVERY=4_000,
     EVAL_PATIENCE=10,
     EVAL_MIN_DELTA=0.0,
     VAL_SAMPLES=5_000,
@@ -85,7 +112,16 @@ CFG = dict(
     # True  -> DeepSets (permutation-equivariant; parameter count independent of N)
     USE_DEEPSETS=True,
 
-    # Legacy compatibility key; retained only so older scripts do not break.
+    # A-only DeepSets width for n=20 (tune around these first)
+    DEEPSETS_D_EMBED=64,
+    DEEPSETS_H_HIDDEN=128,
+
+    # ----------------- Symmetric-assumption switch -----------------
+    # Enables the rank-1 clearing fast path AND permutation augmentation of
+    # training batches AND sharing of the pre-shock clearing across MC
+    # replicas. Only valid when the homogeneous symmetric network assumption
+    # is in force.
+    USE_SYMMETRIC_ASSUMPTION=True,
 
     # Final-step / clearing params
     A_DEAD=-4.0,
@@ -128,7 +164,7 @@ def _default_corr_grid() -> np.ndarray:
 
 if __name__ == "__main__":
     corr_grid = _default_corr_grid()
-    results = sweep_correlation(CFG, corr_grid[corr_grid>0.87], save_dir="C:/git/NetworkValuationML/kL_1_DD_2/20_banks_longer_2", seed=43)
+    results = sweep_correlation(CFG, corr_grid, save_dir="C:/git/NetworkValuationML/kL_1_DD_2/20_banks_longer_3", seed=43)
     # Run a correlation sweep using either naive simulator.
     # Output: CSV with NO header and one line per corr value: corr,avg_pd_T_total
     #sweep_correlation(

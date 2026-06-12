@@ -5,8 +5,8 @@ reusing the exact inference & clearing path from inference_plot.py.
 DeepSets note
 -------------
 DeepSets checkpoints are N-agnostic, so if A_INPUT is scalar you must tell the
-exporter which evaluation size to use. For your current 5-bank runs the default
-below is N_EVAL = 5.
+exporter which evaluation size to use. For your current 20-bank runs the default
+below is N_EVAL = 20.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from inference_plot import (
 from sc_utils import build_L
 
 # =============================== USER CONFIG =============================== #
-MODEL_DIR = "C:/git/NetworkValuationML/kL_1_DD_2/20_banks_longer_2"   # folder with files like step0_corr_{rho:.4f}.pt
+MODEL_DIR = "C:/git/NetworkValuationML/kL_1_DD_2/20_banks_longer_3"   # folder with files like step0_corr_{rho:.4f}.pt
 A_INPUT = [2.0]                                  # scalar (broadcast) or length-n vector of A
 N_EVAL = 20                                       # used for DeepSets when A_INPUT is scalar; change if needed
 A_DEAD = -4.0

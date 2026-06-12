@@ -162,9 +162,9 @@ def solve_self_consistent_pd_rho1(
 if __name__ == "__main__":
     # Example: mimic your defaults (two banks or many — symmetric L gives c=ell=1).
     kL = 1.0
-    net = NetSpec(n_banks=5, colsum_c=kL, liab_ell=kL)
+    net = NetSpec(n_banks=20, colsum_c=kL, liab_ell=kL)
 
-    mdl = ModelSpec(sigma=1.0, T_total=1.0, dt=0.001, gh_nodes=32)
+    mdl = ModelSpec(sigma=1.0, T_total=1.0, dt=0.1, gh_nodes=32)
     grd = GridSpec(A0=2.0, nA=801)
 
     out = solve_self_consistent_pd_rho1(net, mdl, grd)

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -33,22 +33,23 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 
 # --- use the same utilities the trainer uses ---
-from sc_utils import build_L, iterative_breach_feature  # ψ and exposures, ABM version  [training uses this]
+from sc_utils import build_L, iterative_breach_feature, infer_homogeneous_complete_ell  # ψ and exposures, ABM version  [training uses this]
 from sc_core import hard_clear_pd                       # hard clearing projection       [training uses this]
 
 
 # =============================== USER CONFIG =============================== #
-MODEL_DIR = "10_steps_3_DD_0_5_kL/five_banks_orig"  # folder with files like: step0_corr_{rho:.4f}.pt
+MODEL_DIR = "C:/git/NetworkValuationML/kL_1_DD_2/20_banks_longer_3"  # folder with files like: step0_corr_{rho:.4f}.pt
 A_INPUT  = [2.0]            # scalar (broadcast) or length-n vector of A (distance-to-default)
 A_DEAD   = -4.0            # sentinel for “already-defaulted”; only used if your clearing uses a_dead
-kL = 0.5
+kL = 1.0
 L_MATRIX = None            # optional custom exposure matrix (list[list[float]]), overrides kL
 LIAB_VECTOR = None         # optional custom liabilities; default = row sums of L_MATRIX
+N_EVAL = 20             # used for DeepSets when A_INPUT is scalar; change if evaluating at another N
 # parameters that must match your training setup
 SIGMA = 1.0
 T_TOTAL = 1.0
 DT = 0.1
-STEP = 0 #leave this on 0
+STEP = 0 # leave this at 0 for step-0 nets
 K_SURV_ITERS = 5            # iterations in ψ fixed point
 
 # plotting / diagnostics
@@ -169,7 +170,11 @@ class _DynamicDeepSets(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         e = self.phi(x)
         S = e.sum(dim=1, keepdim=True)
-        others = S - e
+        n = int(x.shape[1])
+        if n > 1:
+            others = (S - e) / float(n - 1)
+        else:
+            others = torch.zeros_like(e)
         h = torch.cat([x, others], dim=-1)
         return self.g(h).squeeze(-1)
 
@@ -179,7 +184,7 @@ class _PDInferDeepSets(nn.Module):
     def __init__(self, n: int, F: int, d_embed: int, h_hidden: int):
         super().__init__()
         self.mlp = _DynamicDeepSets(F, d_embed, h_hidden)
-        self.n = int(n)  # the n the model was *trained* at; not enforced at eval
+        self.n = int(n)  # placeholder for compatibility; eval can use any n
         self.in_features_per_node = int(F)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -249,10 +254,7 @@ def _load_model_from_ckpt(ckpt: Path):
                 f"DeepSets checkpoint expects F={F} features per node; "
                 f"only F=1 or F=2 are supported by this plotter."
             )
-        # n is not stored in the DeepSets state-dict (the model is N-agnostic);
-        # downstream code passes A explicitly, so we just record a placeholder.
-        n_placeholder = 1
-        model = _PDInferDeepSets(n_placeholder, F, d_embed, h_hidden)
+        model = _PDInferDeepSets(1, F, d_embed, h_hidden)
         model.load_state_dict(sd, strict=True)
         model.eval()
         return rho, model
@@ -274,36 +276,131 @@ def _load_model_from_ckpt(ckpt: Path):
 
 
 @torch.no_grad()
-def _broadcast_np(x: List[float], n: int, name: str) -> np.ndarray:
+def _broadcast_np(x: Sequence[float], n: int, name: str) -> np.ndarray:
     """Allow single scalar or length-n values."""
-    if len(x) == 1:
-        return np.full(n, float(x[0]), dtype=np.float32)
-    if len(x) == n:
-        return np.array(x, dtype=np.float32)
-    raise ValueError(f"{name} must be length 1 or {n} (got {len(x)})")
+    x_list = list(x)
+    if len(x_list) == 1:
+        return np.full(n, float(x_list[0]), dtype=np.float32)
+    if len(x_list) == n:
+        return np.array(x_list, dtype=np.float32)
+    raise ValueError(f"{name} must be length 1 or {n} (got {len(x_list)})")
 
 
 @torch.no_grad()
-def _eval_L_liab(n: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluation-time clearing matrices.
+def _resolve_eval_n(
+    model,
+    A_vals: Sequence[float],
+    *,
+    n_eval: Optional[int] = None,
+    L_matrix=None,
+    liab_vector=None,
+) -> int:
+    """Infer the evaluation bank count.
+
+    Flat MLP checkpoints store n directly. DeepSets checkpoints are N-agnostic,
+    so the evaluation size must come from one or more explicit sources.
+
+    Accepted sources (which must agree if more than one is supplied):
+      • L_matrix shape
+      • liab_vector length
+      • n_eval
+      • len(A_vals), but only when A_vals is already a full length-n vector
+
+    A scalar A_INPUT=[a] is therefore ambiguous for DeepSets unless L_matrix,
+    liab_vector, or n_eval is supplied.
+    """
+    if not isinstance(model, _PDInferDeepSets):
+        return int(model.n)
+
+    candidates: list[tuple[str, int]] = []
+
+    if L_matrix is not None:
+        L = torch.as_tensor(L_matrix)
+        if L.ndim != 2 or int(L.shape[0]) != int(L.shape[1]):
+            raise ValueError(f"L_matrix must be square (got shape {tuple(L.shape)}).")
+        candidates.append(("L_matrix", int(L.shape[0])))
+
+    if liab_vector is not None:
+        liab = torch.as_tensor(liab_vector)
+        if liab.ndim != 1:
+            raise ValueError(f"liab_vector must be 1-D (got shape {tuple(liab.shape)}).")
+        candidates.append(("liab_vector", int(liab.shape[0])))
+
+    if n_eval is not None:
+        candidates.append(("n_eval", int(n_eval)))
+
+    A_vals_list = list(A_vals)
+    if len(A_vals_list) > 1:
+        candidates.append(("A_vals", int(len(A_vals_list))))
+
+    if not candidates:
+        raise ValueError(
+            "DeepSets checkpoints are N-agnostic, so the evaluation bank count "
+            "cannot be inferred from scalar A_INPUT=[a]. Set N_EVAL, pass a "
+            "length-n A_INPUT vector, or provide L_MATRIX/LIAB_VECTOR."
+        )
+
+    names = [name for name, _ in candidates]
+    values = [value for _, value in candidates]
+    n = values[0]
+    for name, value in candidates[1:]:
+        if value != n:
+            raise ValueError(
+                f"Inconsistent evaluation bank counts: {candidates}. "
+                "L_matrix / liab_vector / N_EVAL / A_INPUT length must agree."
+            )
+
+    if n <= 0:
+        raise ValueError(f"Evaluation bank count must be positive (got {n} from {names}).")
+    return int(n)
+
+
+@torch.no_grad()
+def _eval_L_liab(
+    n: int,
+    *,
+    kL: float,
+    L_matrix=None,
+    liab_vector=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build evaluation-time clearing matrices.
 
     By default we mirror the original homogeneous complete-network setup
-    L_ij = kL/(n-1), i != j. If L_MATRIX is provided in the USER CONFIG
-    block, it is used verbatim so diagnostics can be run without any hidden
-    symmetry assumption.
+    L_ij = kL/(n-1), i != j. If L_matrix is supplied, it is used verbatim.
+
+    For n==1, the natural default is the zero matrix / zero liabilities.
     """
-    if L_MATRIX is not None:
-        L = torch.as_tensor(L_MATRIX, dtype=torch.float32)
-        if tuple(L.shape) != (int(n), int(n)):
-            raise ValueError(f"L_MATRIX must have shape ({n}, {n}) (got {tuple(L.shape)}).")
-        if LIAB_VECTOR is not None:
-            liab = torch.as_tensor(LIAB_VECTOR, dtype=torch.float32)
-            if tuple(liab.shape) != (int(n),):
-                raise ValueError(f"LIAB_VECTOR must have shape ({n},) (got {tuple(liab.shape)}).")
+    n = int(n)
+    if n <= 0:
+        raise ValueError(f"evaluation bank count must be positive (got {n}).")
+
+    if L_matrix is not None:
+        L = torch.as_tensor(L_matrix, dtype=torch.float32)
+        if tuple(L.shape) != (n, n):
+            raise ValueError(f"L_matrix must have shape ({n}, {n}) (got {tuple(L.shape)}).")
+        if liab_vector is not None:
+            liab = torch.as_tensor(liab_vector, dtype=torch.float32)
+            if tuple(liab.shape) != (n,):
+                raise ValueError(f"liab_vector must have shape ({n},) (got {tuple(liab.shape)}).")
         else:
             liab = L.sum(1)
         return L, liab
-    L = build_L(n, offdiag=kL/(n-1))
+
+    if liab_vector is not None:
+        liab = torch.as_tensor(liab_vector, dtype=torch.float32)
+        if tuple(liab.shape) != (n,):
+            raise ValueError(f"liab_vector must have shape ({n},) (got {tuple(liab.shape)}).")
+        if n == 1:
+            return torch.zeros(1, 1, dtype=torch.float32), liab
+        raise ValueError(
+            "liab_vector without L_matrix is ambiguous for n > 1. Provide L_matrix as well, "
+            "or let the helper build the default homogeneous L from kL."
+        )
+
+    if n == 1:
+        return torch.zeros(1, 1, dtype=torch.float32), torch.zeros(1, dtype=torch.float32)
+
+    L = build_L(n, offdiag=float(kL) / float(n - 1))
     liab = L.sum(1)
     return L, liab
 
@@ -332,8 +429,8 @@ def predict_pd_postclearing(
     B, n = A.shape
 
     if L is None or liab is None:
-        # training exposures/liabilities are built from L.sum(1)                 [sc_utils.build_matrices]
-        L, liab = _eval_L_liab(n)  # outside liabilities were merged into A in this ABM setup
+        L, liab = _eval_L_liab(n, kL=kL, L_matrix=L_MATRIX, liab_vector=LIAB_VECTOR)
+    ell = infer_homogeneous_complete_ell(L)
 
     # same time index as in diagnostics: residual horizon at this step
     T_now = max(float(T_total) - step * float(dt), 1e-8)
@@ -342,15 +439,15 @@ def predict_pd_postclearing(
     if getattr(model, "in_features_per_node", 1) == 1:
         x = A.unsqueeze(-1)                          # (B, n, 1)  -> [A]
     else:
-        psi = iterative_breach_feature(A, L, liab,   # (B, n)     -> ψ(A | counterparty)
+        psi = iterative_breach_feature(A, L, liab,
                                        sigma=float(sigma), T=T_now,
-                                       k=int(k_surv_iters), a_dead=float(a_dead))
+                                       k=int(k_surv_iters), a_dead=float(a_dead), ell=ell)
         x = torch.stack([A, psi], dim=-1)           # (B, n, 2)  -> [A, ψ]
 
     # logits -> prob -> hard clearing (post-processing)
     logits = model(x).squeeze(-1)                   # (B, n)
     pd_raw = torch.sigmoid(logits)
-    pd_proj, _ = hard_clear_pd(pd_raw, A, L, liab, n_it=int(n), a_dead=float(a_dead))
+    pd_proj, _ = hard_clear_pd(pd_raw, A, L, liab, n_it=int(n), a_dead=float(a_dead), ell=ell)
 
     return pd_proj.squeeze(0) if B == 1 else pd_proj
 
@@ -382,20 +479,11 @@ def plot_pd_vs_rho(
     if not ckpts:
         raise FileNotFoundError(f"No 'step0_corr_*.pt' files in {model_dir}")
 
-    # First model defines n (and F) for broadcasting input.
-    # For DeepSets the model is N-agnostic; in that case n is inferred from
-    # the length of `A_vals` (or set to 1 if a scalar was passed, which then
-    # also implies n=1 — usually you'd pass a vector for DeepSets eval).
     rho0, model0 = _load_model_from_ckpt(ckpts[0])
-    is_deepsets = isinstance(model0, _PDInferDeepSets)
-    if is_deepsets:
-        n = max(int(len(A_vals)), 1)
-    else:
-        n = model0.n
+    n = _resolve_eval_n(model0, A_vals, n_eval=N_EVAL, L_matrix=L_MATRIX, liab_vector=LIAB_VECTOR)
     A_vec = _broadcast_np(A_vals, n, "A")
 
-    # Build clearing matrices once (ρ affects training dR, not L here)
-    L, liab = _eval_L_liab(n)
+    L, liab = _eval_L_liab(n, kL=kL, L_matrix=L_MATRIX, liab_vector=LIAB_VECTOR)
 
     rhos: List[float] = []
     rows: List[np.ndarray] = []
@@ -406,7 +494,7 @@ def plot_pd_vs_rho(
                                  dt=dt, step=step, k_surv_iters=k_surv_iters,
                                  a_dead=a_dead, L=L, liab=liab).numpy()
     if PRINT_DIAG:
-        print(f"[plotter‑diag] rho={rho0:.4f}  A={A_vec.tolist()}  post‑clear PD={np.round(pd,4).tolist()}  mean={pd.mean():.4f}")
+        print(f"[plotter-diag] rho={rho0:.4f}  A={A_vec.tolist()}  post-clear PD={np.round(pd,4).tolist()}  mean={pd.mean():.4f}")
     rhos.append(rho0); rows.append(pd)
 
     # Remaining checkpoints
@@ -418,7 +506,7 @@ def plot_pd_vs_rho(
                                      dt=dt, step=step, k_surv_iters=k_surv_iters,
                                      a_dead=a_dead, L=L, liab=liab).numpy()
         if PRINT_DIAG:
-            print(f"[plotter‑diag] rho={rho:.4f}  A={A_vec.tolist()}  post‑clear PD={np.round(pd,4).tolist()}  mean={pd.mean():.4f}")
+            print(f"[plotter-diag] rho={rho:.4f}  A={A_vec.tolist()}  post-clear PD={np.round(pd,4).tolist()}  mean={pd.mean():.4f}")
         rhos.append(rho)
         rows.append(pd)
 
