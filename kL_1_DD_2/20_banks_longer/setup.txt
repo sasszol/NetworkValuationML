@@ -1,0 +1,76 @@
+CFG = dict(
+    N_BANKS=20,
+    TOTAL_STEPS=10,        # number of revaluation dates (final settlement after last propagation)
+    T_TOTAL=1.0,           # overall horizon
+    DT=0.1,                # step size
+    SIGMA=1.0,
+    INIT_DD=2.0,
+    ASSET_CORR=0.80,       # correlation of increments (one-factor)
+    kL=1.0,
+    BUFFER_SIZE=30_000,
+
+    # ----------------- NEW: choose naive buffer generator -----------------
+    # "sc_data" or "static_barrier" (SDB)
+    NAIVE_PATHS_METHOD="static_barrier",
+
+    # MC knobs
+    K_MC=5,
+    K_MC_VALID=2_000,
+    MC_SIM_MAX_ROWS=16_384,   # max replicated rows per teacher/validation chunk
+    MC_REPLICA_BLOCK=32,      # max MC replicas per chunk
+
+    BATCH_FRACT=1,
+
+    # Refresh schedule
+    REFRESH_EVERY=40,
+    REFRESH_FRACT=1,
+    REFRESH_EVERY_SCHEDULE={0: 40},
+    REFRESH_FRACT_SCHEDULE={0: 1},
+
+    MAX_EPOCHS=4_000,
+    LR_SMALL=2e-4,
+    LR_SCHEDULE={0: 3e-4, 4_000: 1e-4, 7_000: 6e-5},
+    GRAD_CLIP=1.0,
+
+    EVAL_EVERY=2000,
+    EVAL_PATIENCE=10,
+    EVAL_MIN_DELTA=0.0,
+    VAL_SAMPLES=5_000,
+
+    # ----------------- Architecture switch -----------------
+    # False -> original BaseMLP (Flatten -> 64 -> 64 -> 32 -> N)
+    # True  -> DeepSets (permutation-equivariant; parameter count independent of N)
+    USE_DEEPSETS=True,
+
+    # Legacy compatibility key; retained only so older scripts do not break.
+
+    # Final-step / clearing params
+    A_DEAD=-4.0,
+    ZERO_WARMSTART=True,
+    USE_STE_CLEARING=True,
+
+    # feature: breach ψ (counterparty-aware survival complement)
+    K_SURV_ITERS=5,
+    USE_PHI_FEATURE=False,       # use [A, ψ] as inputs
+
+    MASK_LOSS_TO_SURVIVORS=True,
+
+    # ---------------- NEW: rollout sampler knobs ----------------
+    USE_ROLLOUT_PATHS=True,  # turn on the multi-step rollout buffers
+    BAND_MULT=1.5,  # width around INIT_DD for scenario base
+    INIT_JITTER=0.05,  # per-bank jitter (shrinks as ρ→1)
+    STEP_JITTER_SD=0.0,  # tiny extra idio jitter added to dR each step
+    SCENARIO_STRESS_PROB=0.15,  # optional stress mixture
+    SCENARIO_STRESS_SHIFT=-1.0,
+
+    # stochastic extra defaults per step (asset/network-correlated)
+    EXTRA_DEFAULTS_ON=True,
+    EXTRA_INTENSITY=0.20,  # scales ψ → extra default prob
+    EXTRA_CAP=0.25,  # cap for extra default probability
+    EXTRA_RHO=None,  # None → use ASSET_CORR
+
+    # SDB-only solver tolerance (Picard fixed point)
+    SDB_TOL=1e-6,
+
+    # Diagnostics
+    DIAG_A_LIST=[2.0],
