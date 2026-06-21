@@ -29,9 +29,9 @@ from inference_plot import (
 from sc_utils import build_L
 
 # =============================== USER CONFIG =============================== #
-MODEL_DIR = "C:/git/NetworkValuationML/kL_1_DD_2/20_banks_longer_3"   # folder with files like step0_corr_{rho:.4f}.pt
+MODEL_DIR = "C:/git/NetworkValuationML/kL_1_DD_2/5_banks"   # folder with files like step0_corr_{rho:.4f}.pt
 A_INPUT = [2.0]                                  # scalar (broadcast) or length-n vector of A
-N_EVAL = 20                                       # used for DeepSets when A_INPUT is scalar; change if needed
+N_EVAL = 5                                       # used for DeepSets when A_INPUT is scalar; change if needed
 A_DEAD = -4.0
 kL = 1.0
 L_MATRIX = None                                  # optional custom exposure matrix (list[list[float]])

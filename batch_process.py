@@ -66,7 +66,7 @@ from sc_train import sweep_correlation
 
 
 CFG = dict(
-    N_BANKS=20,
+    N_BANKS=5,
     TOTAL_STEPS=10,        # number of revaluation dates (final settlement after last propagation)
     T_TOTAL=1.0,           # overall horizon
     DT=0.1,                # step size
@@ -74,7 +74,7 @@ CFG = dict(
     INIT_DD=2.0,
     ASSET_CORR=0.80,       # correlation of increments (one-factor)
     kL=1.0,
-    BUFFER_SIZE=30_000,
+    BUFFER_SIZE=60_000,
 
     # ----------------- NEW: choose naive buffer generator -----------------
     # "sc_data" or "static_barrier" (SDB)
@@ -92,17 +92,17 @@ CFG = dict(
     BATCH_FRACT=1,
 
     # Refresh schedule
-    REFRESH_EVERY=40,
+    REFRESH_EVERY=20,
     REFRESH_FRACT=1,
     REFRESH_EVERY_SCHEDULE={0: 40},
     REFRESH_FRACT_SCHEDULE={0: 1},
 
     MAX_EPOCHS=2_000,
     LR_SMALL=2e-4,
-    LR_SCHEDULE={0: 7e-4, 4_000: 5e-4, 7_000: 2e-4},
+    LR_SCHEDULE={0: 5e-4, 4_000: 5e-5, 7_000: 2e-4},
     GRAD_CLIP=1.0,
 
-    EVAL_EVERY=4_000,
+    EVAL_EVERY=500,
     EVAL_PATIENCE=10,
     EVAL_MIN_DELTA=0.0,
     VAL_SAMPLES=5_000,
@@ -164,7 +164,7 @@ def _default_corr_grid() -> np.ndarray:
 
 if __name__ == "__main__":
     corr_grid = _default_corr_grid()
-    results = sweep_correlation(CFG, corr_grid, save_dir="C:/git/NetworkValuationML/kL_1_DD_2/20_banks_longer_3", seed=43)
+    results = sweep_correlation(CFG, corr_grid[corr_grid>0.99], save_dir="C:/git/NetworkValuationML/kL_1_DD_2/5_banks", seed=43)
     # Run a correlation sweep using either naive simulator.
     # Output: CSV with NO header and one line per corr value: corr,avg_pd_T_total
     #sweep_correlation(

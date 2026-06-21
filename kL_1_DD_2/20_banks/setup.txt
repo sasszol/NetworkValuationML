@@ -7,17 +7,20 @@ CFG = dict(
     INIT_DD=2.0,
     ASSET_CORR=0.80,       # correlation of increments (one-factor)
     kL=1.0,
-    BUFFER_SIZE=30_000,
+    BUFFER_SIZE=80_000,
 
     # ----------------- NEW: choose naive buffer generator -----------------
     # "sc_data" or "static_barrier" (SDB)
     NAIVE_PATHS_METHOD="static_barrier",
 
     # MC knobs
-    K_MC=50,
+    K_MC=1,
     K_MC_VALID=2_000,
-    MC_SIM_MAX_ROWS=16_384,   # max replicated rows per teacher/validation chunk
-    MC_REPLICA_BLOCK=32,      # max MC replicas per chunk
+    # Memory-control knobs for teacher / validation MC simulation.
+    # They do NOT change the estimator; they only chunk the replicated
+    # `(buffer * K_MC, ...)` simulation so it fits on smaller GPUs.
+    MC_SIM_MAX_ROWS=32_768,
+    MC_REPLICA_BLOCK=8,
 
     BATCH_FRACT=1,
 
@@ -27,9 +30,9 @@ CFG = dict(
     REFRESH_EVERY_SCHEDULE={0: 40},
     REFRESH_FRACT_SCHEDULE={0: 1},
 
-    MAX_EPOCHS=2_000,
+    MAX_EPOCHS=1_000,
     LR_SMALL=2e-4,
-    LR_SCHEDULE={0: 7e-4, 4_000: 5e-4, 7_000: 2e-4},
+    LR_SCHEDULE={0: 5e-4, 4_000: 5e-5, 7_000: 2e-4},
     GRAD_CLIP=1.0,
 
     EVAL_EVERY=500,
@@ -42,7 +45,16 @@ CFG = dict(
     # True  -> DeepSets (permutation-equivariant; parameter count independent of N)
     USE_DEEPSETS=True,
 
-    # Legacy compatibility key; retained only so older scripts do not break.
+    # A-only DeepSets width for n=20 (tune around these first)
+    DEEPSETS_D_EMBED=64,
+    DEEPSETS_H_HIDDEN=128,
+
+    # ----------------- Symmetric-assumption switch -----------------
+    # Enables the rank-1 clearing fast path AND permutation augmentation of
+    # training batches AND sharing of the pre-shock clearing across MC
+    # replicas. Only valid when the homogeneous symmetric network assumption
+    # is in force.
+    USE_SYMMETRIC_ASSUMPTION=True,
 
     # Final-step / clearing params
     A_DEAD=-4.0,
