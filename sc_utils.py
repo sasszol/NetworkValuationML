@@ -20,7 +20,7 @@ def infer_homogeneous_complete_ell(
     """Detect the homogeneous complete-network form ``L = ell * (11^T - I)``.
 
     This is a structural check on the fixed liability matrix. When it succeeds,
-    the rank-1 formulas used in clearing / ψ evaluation are exact even after the
+    the rank-1 formulas used in clearing / breach-proxy evaluation are exact even after the
     realised asset vector becomes heterogeneous.
     """
     if L.ndim != 2 or L.shape[0] != L.shape[1]:
@@ -117,11 +117,6 @@ def sample_A0_band(
       - sc_data.build_rollout_paths
       - sc_staticbarrier_benchmark (state-dependent static-barrier benchmark)
 
-    The construction follows the LaTeX description:
-      - scenario-level base drawn uniformly in a band around INIT_DD
-      - optional stressed mixture (scenario-level shift)
-      - optional per-bank jitter, scaled by sqrt(1-rho) so dispersion shrinks as rho -> 1
-
     Parameters
     ----------
     S : number of scenarios
@@ -173,8 +168,6 @@ def draw_shocks_factor(
     """Correlated ABM increments via a single common-factor decomposition.
 
     Output shape: (sz, n)
-
-    Note: this construction assumes rho in [0,1].
     """
     scale = float(sigma) * math.sqrt(float(dt))
     mkt = torch.randn(int(sz), 1, device=device)  # common market factor M
@@ -219,7 +212,7 @@ def _apply_L_util(spay: torch.Tensor,
 
 
 @torch.no_grad()
-def iterative_survival_feature(
+def iterative_counterparty_survival(
     A: torch.Tensor,
     L: "torch.Tensor | None",
     liab: torch.Tensor,
@@ -231,32 +224,30 @@ def iterative_survival_feature(
     *,
     ell: "float | None" = None,
 ) -> torch.Tensor:
-    """Counterparty-aware survival phi via fixed point on expected payments.
+    """Counterparty-aware ABM survival probability via expected-payment fixed point.
 
-    Alive is inferred from assets via the sentinel: A > a_dead.
-
-    If `ell` is provided, uses the symmetric rank-1 form of L
-    (L = ell*(11^T - I)); `L` may then be passed as None.
+    This helper is used only by optional data-generator overlays/diagnostics, not
+    as a neural-network input feature in the A-only trainer.
     """
     liab_row = liab.unsqueeze(0)
     S = (A > (float(a_dead) + eps)).float()
 
     spay = S  # initial guess: survivors pay 1
     H = liab_row - _apply_L_util(spay, L, ell)
-    phi = _survival_abm(A, H, float(sigma), float(T), eps)
-    phi = torch.minimum(phi, S)
+    surv = _survival_abm(A, H, float(sigma), float(T), eps)
+    surv = torch.minimum(surv, S)
 
     for _ in range(int(max(0, k))):
-        spay = torch.minimum(S, phi)
+        spay = torch.minimum(S, surv)
         H = liab_row - _apply_L_util(spay, L, ell)
-        phi = _survival_abm(A, H, float(sigma), float(T), eps)
-        phi = torch.minimum(phi, S)
+        surv = _survival_abm(A, H, float(sigma), float(T), eps)
+        surv = torch.minimum(surv, S)
 
-    return phi
+    return surv
 
 
 @torch.no_grad()
-def iterative_breach_feature(
+def iterative_breach_probability(
     A: torch.Tensor,
     L: "torch.Tensor | None",
     liab: torch.Tensor,
@@ -268,6 +259,6 @@ def iterative_breach_feature(
     *,
     ell: "float | None" = None,
 ) -> torch.Tensor:
-    """Barrier breach probability psi = 1 - phi_survival (ABM, iterated)."""
-    surv = iterative_survival_feature(A, L, liab, sigma, T, k, a_dead, eps, ell=ell)
+    """Counterparty-aware ABM breach probability, equal to one minus survival."""
+    surv = iterative_counterparty_survival(A, L, liab, sigma, T, k, a_dead, eps, ell=ell)
     return 1.0 - surv

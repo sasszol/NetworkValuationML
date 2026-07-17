@@ -1,9 +1,12 @@
 import math
+import profile
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from line_profiler_pycharm import profile
 
 def approx_min_ce(t: torch.Tensor) -> float:
     t = torch.clamp(t, 1e-6, 1 - 1e-6)
@@ -15,7 +18,7 @@ def squeeze_last(x: torch.Tensor) -> torch.Tensor:
 
 class BaseMLP(nn.Module):
     """Flat MLP that outputs logits (no sigmoid)."""
-    def __init__(self, n: int, in_features_per_node: int = 2):
+    def __init__(self, n: int, in_features_per_node: int = 1):
         super().__init__()
         self.n = int(n)
         self.F = int(in_features_per_node)
@@ -40,10 +43,9 @@ class DeepSetsPD(nn.Module):
 
     This A-only-friendly version normalizes the leave-one-out pooled context by
     (n-1), so changing the number of banks does not automatically rescale the
-    input seen by g. For fixed-n training this is a pure optimization / scaling
-    choice; it does not discard information that matters at a single fixed n.
+    input seen by g.
     """
-    def __init__(self, n: int, in_features_per_node: int = 2,
+    def __init__(self, n: int, in_features_per_node: int = 1,
                  d_embed: int = 64, h_hidden: int = 128):
         super().__init__()
         self.n = int(n)
@@ -78,7 +80,7 @@ class DeepSetsPD(nn.Module):
 
 class PDToMaturityNet(nn.Module):
     """Predicts till-maturity PD logits using a swappable backbone."""
-    def __init__(self, n: int, in_features_per_node: int = 2,
+    def __init__(self, n: int, in_features_per_node: int = 1,
                  use_deepsets: bool = False,
                  d_embed: int = 64, h_hidden: int = 128):
         super().__init__()
@@ -105,11 +107,12 @@ class PDToMaturityNet(nn.Module):
 def _apply_L(spay: torch.Tensor,
              L: Optional[torch.Tensor],
              ell: Optional[float]) -> torch.Tensor:
-    if ell is not None:
+    if ell is not None: #TODO matrix operation instead of ifs
         Sigma = spay.sum(dim=-1, keepdim=True)
         return float(ell) * (Sigma - spay)
     return spay @ L
 
+@profile
 @torch.no_grad()
 def hard_clear_pd(pd: torch.Tensor,
                   A: torch.Tensor,

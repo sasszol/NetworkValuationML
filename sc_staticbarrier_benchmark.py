@@ -488,7 +488,7 @@ def simulate_sc_data_once(
             T_total=float(T_total),
             rho=float(rho),
             a_dead=float(a_dead),
-            k_surv_iters=int(cfg.get("K_SURV_ITERS", 5)),
+            k_surv_iters=int(cfg.get("EXTRA_K_SURV_ITERS", 5)),
             extra_on=True,
             extra_intensity=float(cfg.get("EXTRA_INTENSITY", 0.20)),
             extra_cap=float(cfg.get("EXTRA_CAP", 0.25)),

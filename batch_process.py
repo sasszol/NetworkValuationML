@@ -44,7 +44,7 @@ USE_SYMMETRIC_ASSUMPTION  (computational switch; valid iff the homogeneous
 
     * Option B (data-side symmetrisation):
         - permutation augmentation of training batches (joint S_n permutation
-          of A, psi, target). For a non-equivariant predictor this teaches the
+          of A and target). For a non-equivariant predictor this teaches the
           symmetry directly from data and improves sample efficiency, so
           fewer K_MC may be sufficient at the same target MSE.
 
@@ -63,6 +63,7 @@ USE_SYMMETRIC_ASSUMPTION  (computational switch; valid iff the homogeneous
 import numpy as np
 
 from sc_train import sweep_correlation
+from line_profiler_pycharm import profile
 
 
 CFG = dict(
@@ -74,20 +75,19 @@ CFG = dict(
     INIT_DD=2.0,
     ASSET_CORR=0.80,       # correlation of increments (one-factor)
     kL=1.0,
-    BUFFER_SIZE=60_000,
+    BUFFER_SIZE=6_000,
 
-    # ----------------- NEW: choose naive buffer generator -----------------
     # "sc_data" or "static_barrier" (SDB)
     NAIVE_PATHS_METHOD="static_barrier",
 
     # MC knobs
-    K_MC=50,
+    K_MC=1,
     K_MC_VALID=2_000,
     # Memory-control knobs for teacher / validation MC simulation.
     # They do NOT change the estimator; they only chunk the replicated
     # `(buffer * K_MC, ...)` simulation so it fits on smaller GPUs.
-    MC_SIM_MAX_ROWS=32_768,
-    MC_REPLICA_BLOCK=8,
+    MC_SIM_MAX_ROWS=600_000,
+    MC_REPLICA_BLOCK=50,
 
     BATCH_FRACT=1,
 
@@ -97,7 +97,7 @@ CFG = dict(
     REFRESH_EVERY_SCHEDULE={0: 40},
     REFRESH_FRACT_SCHEDULE={0: 1},
 
-    MAX_EPOCHS=2_000,
+    MAX_EPOCHS=1_000,
     LR_SMALL=2e-4,
     LR_SCHEDULE={0: 5e-4, 4_000: 5e-5, 7_000: 2e-4},
     GRAD_CLIP=1.0,
@@ -107,7 +107,6 @@ CFG = dict(
     EVAL_MIN_DELTA=0.0,
     VAL_SAMPLES=5_000,
 
-    # ----------------- Architecture switch -----------------
     # False -> original BaseMLP (Flatten -> 64 -> 64 -> 32 -> N)
     # True  -> DeepSets (permutation-equivariant; parameter count independent of N)
     USE_DEEPSETS=True,
@@ -116,8 +115,7 @@ CFG = dict(
     DEEPSETS_D_EMBED=64,
     DEEPSETS_H_HIDDEN=128,
 
-    # ----------------- Symmetric-assumption switch -----------------
-    # Enables the rank-1 clearing fast path AND permutation augmentation of
+    # Enables the fully connected clearing fast path AND permutation augmentation of
     # training batches AND sharing of the pre-shock clearing across MC
     # replicas. Only valid when the homogeneous symmetric network assumption
     # is in force.
@@ -128,14 +126,10 @@ CFG = dict(
     ZERO_WARMSTART=True,
     USE_STE_CLEARING=True,
 
-    # feature: breach ψ (counterparty-aware survival complement)
-    K_SURV_ITERS=5,
-    USE_PHI_FEATURE=False,       # use [A, ψ] as inputs
-
     MASK_LOSS_TO_SURVIVORS=True,
 
-    # ---------------- NEW: rollout sampler knobs ----------------
-    USE_ROLLOUT_PATHS=True,  # turn on the multi-step rollout buffers
+    # Rollout sampler knobs
+    USE_ROLLOUT_PATHS=True,  # turn on the multi-step rollout buffers - recommended
     BAND_MULT=1.5,  # width around INIT_DD for scenario base
     INIT_JITTER=0.05,  # per-bank jitter (shrinks as ρ→1)
     STEP_JITTER_SD=0.0,  # tiny extra idio jitter added to dR each step
@@ -144,7 +138,8 @@ CFG = dict(
 
     # stochastic extra defaults per step (asset/network-correlated)
     EXTRA_DEFAULTS_ON=True,
-    EXTRA_INTENSITY=0.20,  # scales ψ → extra default prob
+    EXTRA_K_SURV_ITERS=5,     # optional extra-default overlay fixed-point iterations
+    EXTRA_INTENSITY=0.20,  # scales the overlay breach proxy to extra default prob
     EXTRA_CAP=0.25,  # cap for extra default probability
     EXTRA_RHO=None,  # None → use ASSET_CORR
 
@@ -164,13 +159,9 @@ def _default_corr_grid() -> np.ndarray:
 
 if __name__ == "__main__":
     corr_grid = _default_corr_grid()
-    results = sweep_correlation(CFG, corr_grid[corr_grid>0.99], save_dir="C:/git/NetworkValuationML/kL_1_DD_2/5_banks", seed=43)
+    results = sweep_correlation(CFG, corr_grid[corr_grid>0.99], save_dir="C:/git/NetworkValuationML/kL_1_DD_2/5_banks_r", seed=43)
     # Run a correlation sweep using either naive simulator.
-    # Output: CSV with NO header and one line per corr value: corr,avg_pd_T_total
-    #sweep_correlation(
-    #    CFG,
-    #    corr_grid,
-    #    seed=43,
-    #    out_csv=str("baseline.csv"),
-    #    method="sc_data",
-    #)
+
+    # TODO in-place operations (_)
+    # TODO mi a fv, mi az input mi az output, hogy reprezental output, milyen szinten vektorizal
+    # TODO mit kulon kezel mit egyben. loop ido menten kell-e vagy vektorizalom?

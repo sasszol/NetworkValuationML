@@ -4,6 +4,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Dict, Iterable, Tuple, List, Any, Optional, Sequence
 
+from line_profiler_pycharm import profile
+
 import torch
 import torch.nn as nn
 from tqdm import trange
@@ -12,7 +14,7 @@ from sc_core import (
     PDToMaturityNet, LastStepPDIter, approx_min_ce, squeeze_last,
     hard_clear_pd, ste_clear_pd
 )
-from sc_utils import build_matrices, iterative_breach_feature, draw_shocks_factor
+from sc_utils import build_matrices, draw_shocks_factor
 from sc_data import create_asset_buffer, make_dR_buffer, multistep_asset_buffers
 from sc_staticbarrier_benchmark import multistep_asset_buffers_sdb
 from sc_zero import ZeroSubModel
@@ -85,6 +87,51 @@ def _mc_replica_block(cfg: Dict[str, Any], k_total: int) -> int:
 
 
 @torch.no_grad()
+def _current_step_pd_and_survival(nets,
+                                  step: int,
+                                  A_t: torch.Tensor,
+                                  L,
+                                  liab: torch.Tensor,
+                                  n_it: int,
+                                  *,
+                                  a_dead: float,
+                                  ell: Optional[float]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate the time-t teacher part once on unrepeated base scenarios.
+
+    A-only version: the network input is always ``A_t.unsqueeze(-1)``, with
+    shape ``(B, n, 1)``.  No engineered breach/survival feature is constructed.
+    """
+    inp_t = A_t.unsqueeze(-1)
+    logits_t = squeeze_last(nets[step](inp_t))
+    pd_t_raw = torch.sigmoid(logits_t)
+    pd_t, s_t = hard_clear_pd(pd_t_raw, A_t, L, liab, int(n_it), float(a_dead), ell=ell)
+    return pd_t, s_t
+
+
+@torch.no_grad()
+def _next_step_post_clear_pd(nets,
+                             step: int,
+                             A_tp1: torch.Tensor,
+                             L,
+                             liab: torch.Tensor,
+                             n_it: int,
+                             *,
+                             a_dead: float,
+                             ell: Optional[float]) -> torch.Tensor:
+    """Evaluate the shock-dependent time-(t+1) teacher part on flat rows.
+
+    A-only version: every trainable future net receives ``A_tp1.unsqueeze(-1)``.
+    The terminal net already consumes the same A-only shape.
+    """
+    inp_tp1 = A_tp1.unsqueeze(-1)
+    logits_tp1 = squeeze_last(nets[step + 1](inp_tp1))
+    pd_tp1_raw = torch.sigmoid(logits_tp1)
+    pd_tp1, _ = hard_clear_pd(pd_tp1_raw, A_tp1, L, liab, int(n_it), float(a_dead), ell=ell)
+    return pd_tp1
+
+
+@torch.no_grad()
+@profile
 def _mc_average_td_target(cfg: Dict[str, Any],
                           nets,
                           step: int,
@@ -94,77 +141,73 @@ def _mc_average_td_target(cfg: Dict[str, Any],
                           n_it: int,
                           *,
                           sigma: float,
-                          T_total: float,
                           dt: float,
-                          k_surv_iters: int,
                           a_dead: float,
-                          use_phi: bool,
                           ell: Optional[float],
                           k_mc_total: int,
                           use_sym: bool,
                           dR_single: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Chunked Monte-Carlo average of the TD teacher target.
 
-    This computes exactly the same Monte-Carlo estimator as the previous code,
-    but avoids materialising the full `(B * K_MC_total, ...)` batch at once.
-    That is the main source of the CUDA OOM seen with DeepSets and large
-    `K_MC_VALID` / `K_MC`.
-
-    When `k_mc_total == 1` and `dR_single` is supplied, the provided shock
-    realisation is reused exactly (matching the previous non-MC branch).
+    This A-only/vectorized implementation computes the current-time clearing
+    once per base-scenario chunk, broadcasts the resulting survival mask across
+    MC shock replicas, and evaluates only the shock-dependent next-time part on
+    the expanded ``B * K`` rows.
     """
+    _ = use_sym  # kept for call-site compatibility; sharing is valid for A-only deterministic nets.
+
     B, n = A_base.shape
     K = max(1, int(k_mc_total))
-
-    if K == 1:
-        if dR_single is None:
-            dR_single = draw_shocks_factor(
-                B, n, float(cfg["ASSET_CORR"]), sigma, dt, device=A_base.device
-            )
-        _, tgt_once, _ = simulate_one_step_with_projection(
-            nets, step, A_base, dR_single,
-            L, liab, n_it,
-            sigma=sigma, T_total=T_total,
-            dt=dt, k_surv_iters=k_surv_iters,
-            a_dead=a_dead, use_phi=use_phi,
-            ell=ell,
-            k_mc_share=1,
-        )
-        return tgt_once
-
     rho = float(cfg["ASSET_CORR"])
+
     max_rows = _mc_sim_max_rows(cfg)
-    rep_cap = _mc_replica_block(cfg, K)
+    rep_cap = min(K, _mc_replica_block(cfg, K))
+    base_blk = max(1, max_rows // max(1, rep_cap))
 
     accum = torch.zeros(B, n, device=A_base.device, dtype=A_base.dtype)
-    done = 0
-    while done < K:
-        k_blk = min(rep_cap, K - done)
-        base_blk = max(1, max_rows // k_blk)
 
-        for start in range(0, B, base_blk):
-            stop = min(start + base_blk, B)
-            A_chunk = A_base[start:stop]
-            A_rep = A_chunk.repeat_interleave(k_blk, dim=0)
-            dR_rep = draw_shocks_factor(
-                A_rep.shape[0], n, rho, sigma, dt, device=A_rep.device
+    for start in range(0, B, base_blk):
+        stop = min(start + base_blk, B)
+        B0 = stop - start
+        A_chunk = A_base[start:stop]
+
+        _, s_t = _current_step_pd_and_survival(
+            nets, step, A_chunk, L, liab, n_it,
+            a_dead=a_dead, ell=ell,
+        )
+
+        s_t_3 = s_t.unsqueeze(1)           # (B0, 1, n), broadcasts over replicas
+        A_chunk_3 = A_chunk.unsqueeze(1)   # (B0, 1, n), broadcasts over replicas
+
+        done = 0
+        while done < K:
+            k_blk = min(rep_cap, K - done)
+
+            if K == 1 and dR_single is not None:
+                dR_3 = dR_single[start:stop].unsqueeze(1)
+            else:
+                dR_flat = draw_shocks_factor(B0 * k_blk, n, rho, float(sigma), float(dt),
+                                             device=A_base.device)
+                dR_3 = dR_flat.view(B0, k_blk, n)
+
+            A_tp1_3 = torch.where(
+                s_t_3 > 0.5,
+                A_chunk_3 + dR_3,
+                torch.full((B0, k_blk, n), float(a_dead), device=A_base.device, dtype=A_base.dtype),
             )
-            _, td_blk, _ = simulate_one_step_with_projection(
-                nets, step, A_rep, dR_rep,
-                L, liab, n_it,
-                sigma=sigma, T_total=T_total,
-                dt=dt, k_surv_iters=k_surv_iters,
-                a_dead=a_dead, use_phi=use_phi,
-                ell=ell,
-                k_mc_share=(k_blk if use_sym else 1),
+            A_tp1_flat = A_tp1_3.reshape(B0 * k_blk, n)
+
+            pd_tp1_flat = _next_step_post_clear_pd(
+                nets, step, A_tp1_flat, L, liab, n_it,
+                a_dead=a_dead, ell=ell,
             )
-            accum[start:stop] += td_blk.view(stop - start, k_blk, n).sum(dim=1)
+            pd_tp1_3 = pd_tp1_flat.view(B0, k_blk, n)
 
-            del A_chunk, A_rep, dR_rep, td_blk
+            tgt_3 = (1.0 - s_t_3) + s_t_3 * pd_tp1_3
+            accum[start:stop] += tgt_3.sum(dim=1)
 
-        done += k_blk
-        if A_base.device.type == "cuda":
-            torch.cuda.empty_cache()
+            del dR_3, A_tp1_3, A_tp1_flat, pd_tp1_flat, pd_tp1_3, tgt_3
+            done += k_blk
 
     return accum / float(K)
 
@@ -206,81 +249,39 @@ def simulate_one_step_with_projection(nets,
                                       liab: torch.Tensor,
                                       n_it: int,
                                       *,
-                                      sigma: float,
-                                      T_total: float,
-                                      dt: float,
-                                      k_surv_iters: int,
                                       a_dead: float,
-                                      use_phi: bool,
                                       ell: Optional[float] = None,
                                       k_mc_share: int = 1):
-    """
-    Teacher: compute PD_t; CLEAR at t; simulate t→t+1; compute PD_{t+1}; CLEAR at t+1.
-    TD target: (1 - S^+(t)) + S^+(t) * E[PD^{post}(t+1)].
+    """A-only post-clearing one-step TD teacher.
 
-    If `ell` is provided, the rank-1 form of L is used in all clearing calls.
-
-    If `k_mc_share > 1`, the inputs `A_t` (and `dR_t`) must be ordered as
-    `repeat_interleave(K_MC, dim=0)` of B unique scenarios — i.e. the first
-    axis has length B*K_MC with K_MC consecutive replicas per scenario. The
-    pre-shock predictor evaluation and the time-t clearing (which depend only
-    on A_t, not on dR_t) are then computed ONCE per scenario and broadcast,
-    giving a ~K_MC × speed-up on that half of the work.
+    The neural input is always ``A.unsqueeze(-1)``.  If ``k_mc_share > 1``, the
+    input rows must be grouped as consecutive replicas of each base scenario,
+    allowing the current-time clearing to be evaluated once per base scenario
+    and broadcast across replicas.
     """
     K = max(1, int(k_mc_share))
 
-    # --- step t (optionally shared across MC replicas)
     if K > 1:
-        # extract the unique scenarios (one row per group of K consecutive replicas)
-        A_t_unique = A_t[::K].contiguous()       # (B_unique, n)
-        T_now = max(T_total - step * dt, 1e-8)
-        if use_phi:
-            psi_u = iterative_breach_feature(A_t_unique, L, liab, sigma, T_now,
-                                             k_surv_iters, a_dead, ell=ell)
-            inp_u = torch.stack([A_t_unique, psi_u], dim=-1)
-        else:
-            inp_u = A_t_unique.unsqueeze(-1)
-
-        logits_u = squeeze_last(nets[step](inp_u))
-        pd_t_raw_u = torch.sigmoid(logits_u)
-        pd_t_u, s_t_u = hard_clear_pd(pd_t_raw_u, A_t_unique, L, liab, n_it, a_dead, ell=ell)
-
-        # broadcast back across replicas
+        A_t_unique = A_t[::K].contiguous()
+        pd_t_u, s_t_u = _current_step_pd_and_survival(
+            nets, step, A_t_unique, L, liab, n_it,
+            a_dead=a_dead, ell=ell,
+        )
         pd_t = pd_t_u.repeat_interleave(K, dim=0)
         s_t = s_t_u.repeat_interleave(K, dim=0)
     else:
-        T_now = max(T_total - step * dt, 1e-8)
-        if use_phi:
-            psi_t = iterative_breach_feature(A_t, L, liab, sigma, T_now,
-                                             k_surv_iters, a_dead, ell=ell)
-            inp_t = torch.stack([A_t, psi_t], dim=-1)
-        else:
-            inp_t = A_t.unsqueeze(-1)
+        pd_t, s_t = _current_step_pd_and_survival(
+            nets, step, A_t, L, liab, n_it,
+            a_dead=a_dead, ell=ell,
+        )
 
-        logits_t = squeeze_last(nets[step](inp_t))
-        pd_t_raw = torch.sigmoid(logits_t)
-        pd_t, s_t = hard_clear_pd(pd_t_raw, A_t, L, liab, n_it, a_dead, ell=ell)
-
-    # --- advance assets with additive ABM; lock new defaults at a_dead
     A_next_free = A_t + dR_t
     A_tp1 = torch.where(s_t > 0.5, A_next_free, torch.full_like(A_t, float(a_dead)))
 
-    # --- step t+1
-    T_next = max(T_total - (step + 1) * dt, 1e-8)
-    next_net = nets[step + 1]
-    if isinstance(next_net, LastStepPDIter):
-        inp_tp1 = A_tp1.unsqueeze(-1)
-    else:
-        if getattr(next_net, "in_features_per_node", 1) >= 2:
-            psi_tp1 = iterative_breach_feature(A_tp1, L, liab, sigma, T_next,
-                                               k_surv_iters, a_dead, ell=ell)
-            inp_tp1 = torch.stack([A_tp1, psi_tp1], dim=-1)
-        else:
-            inp_tp1 = A_tp1.unsqueeze(-1)
-
-    logits_tp1 = squeeze_last(next_net(inp_tp1))
-    pd_tp1_raw = torch.sigmoid(logits_tp1)
-    pd_tp1, _ = hard_clear_pd(pd_tp1_raw, A_tp1, L, liab, n_it, a_dead, ell=ell)
+    pd_tp1 = _next_step_post_clear_pd(
+        nets, step, A_tp1, L, liab, n_it,
+        a_dead=a_dead, ell=ell,
+    )
 
     tgt = (1. - s_t) + s_t * pd_tp1
     return pd_t, tgt, s_t
@@ -289,18 +290,14 @@ def simulate_one_step_with_projection(nets,
 
 @torch.no_grad()
 def _diag_print_step0(step0: nn.Module, cfg: Dict[str, Any], A_list: Sequence[float]) -> None:
-    """
-    Print the post‑clearing PDs of the trained step‑0 net at chosen A.
-    Uses the *same* ψ and hard‑clearing as training (fully consistent).
+    """Print the post-clearing PDs of the trained step-0 net at chosen A.
+
+    A-only diagnostic: input is always ``A.unsqueeze(-1)``.
     """
     device = next(step0.parameters()).device
     n = int(cfg["N_BANKS"])
     L, liab = build_matrices(cfg, device)
     a_dead = float(cfg.get("A_DEAD", -10.0))
-    use_phi = bool(cfg.get("USE_PHI_FEATURE", True))
-    k_phi = int(cfg.get("K_SURV_ITERS", 5))
-    T_now = float(cfg["T_TOTAL"])
-    sigma = float(cfg["SIGMA"])
 
     if len(A_list) == 1:
         A = torch.full((1, n), float(A_list[0]), device=device)
@@ -310,12 +307,7 @@ def _diag_print_step0(step0: nn.Module, cfg: Dict[str, Any], A_list: Sequence[fl
         raise ValueError(f"DIAG_A_LIST must be length 1 or {n} (got {len(A_list)})")
 
     ell = _sym_ell(cfg, n)
-    if use_phi and getattr(step0, "in_features_per_node", 1) >= 2:
-        psi = iterative_breach_feature(A, L, liab, sigma=sigma, T=T_now,
-                                       k=k_phi, a_dead=a_dead, ell=ell)
-        xin = torch.stack([A, psi], dim=-1)
-    else:
-        xin = A.unsqueeze(-1)
+    xin = A.unsqueeze(-1)
 
     logits = squeeze_last(step0(xin))
     pd_raw = torch.sigmoid(logits)
@@ -323,7 +315,7 @@ def _diag_print_step0(step0: nn.Module, cfg: Dict[str, Any], A_list: Sequence[fl
 
     arr = pd_post.squeeze(0).detach().cpu().numpy()
     msg = (f"[diag] corr={cfg['ASSET_CORR']:.4f}  A={list(A_list)}  "
-           f"post‑clear PD mean={arr.mean():.4f}")
+           f"post-clear PD mean={arr.mean():.4f}")
     print(msg)
 
 def np_round(x, k: int = 4):
@@ -334,6 +326,7 @@ def np_round(x, k: int = 4):
         return x
 
 # ----------------------------- training step --------------------------------
+@profile
 def _train_one_step(cfg: Dict[str, Any],
                     nets, step: int,
                     A_buf, dR_buf,
@@ -342,7 +335,8 @@ def _train_one_step(cfg: Dict[str, Any],
                     log: List[str],
                     diag: "TgtBufDiagnostics | None" = None) -> None:
 
-    net = nets[step]; net.train()
+    net = nets[step]
+    net.train()
     opt = torch.optim.Adam(net.parameters(), lr=float(cfg["LR_SMALL"]))
     bce_elem = nn.BCELoss(reduction="none")
     mse = nn.MSELoss()
@@ -350,7 +344,6 @@ def _train_one_step(cfg: Dict[str, Any],
     n_it = int(L.shape[0])
     use_ste = bool(cfg.get("USE_STE_CLEARING", True))
     a_dead = float(cfg.get("A_DEAD", -10.0))
-    use_phi = bool(cfg.get("USE_PHI_FEATURE", True))
     mask_surv = bool(cfg.get("MASK_LOSS_TO_SURVIVORS", True))
 
     n = int(cfg["N_BANKS"])
@@ -361,14 +354,6 @@ def _train_one_step(cfg: Dict[str, Any],
     VAL = int(min(cfg.get("VAL_SAMPLES", BUF // 5), BUF))
     train_pool_idx = torch.arange(VAL, BUF, device=device)
     val_idx = torch.arange(0, VAL, device=device)
-
-    k_phi = int(cfg.get("K_SURV_ITERS", 5))
-    T_now = max(cfg["T_TOTAL"] - step * cfg["DT"], 1e-8)
-    if use_phi:
-        psi_buf = iterative_breach_feature(A_buf, L, liab, sigma=cfg["SIGMA"],
-                                           T=T_now, k=k_phi, a_dead=a_dead, ell=ell)
-    else:
-        psi_buf = None
 
     with torch.no_grad():
         if cfg.get("ZERO_WARMSTART", False):
@@ -382,10 +367,8 @@ def _train_one_step(cfg: Dict[str, Any],
         tgt0 = _mc_average_td_target(
             cfg, nets_for_tgt0, step, A_buf,
             L, liab, n_it,
-            sigma=cfg["SIGMA"], T_total=cfg["T_TOTAL"],
-            dt=cfg["DT"], k_surv_iters=k_phi,
-            a_dead=a_dead, use_phi=use_phi,
-            ell=ell,
+            sigma=cfg["SIGMA"], dt=cfg["DT"],
+            a_dead=a_dead, ell=ell,
             k_mc_total=k_mc,
             use_sym=use_sym,
             dR_single=dR_buf,
@@ -398,8 +381,6 @@ def _train_one_step(cfg: Dict[str, Any],
     best_val_mse = float("inf")
     best_state = None
     eval_bad = 0
-    EVAL_PATIENCE = int(cfg.get("EVAL_PATIENCE", 10))
-    MIN_DELTA = float(cfg.get("EVAL_MIN_DELTA", 0.0))
 
     last_refresh_epoch = -10**9
     next_eval_epoch = int(cfg.get("EVAL_EVERY", 1000))
@@ -416,23 +397,15 @@ def _train_one_step(cfg: Dict[str, Any],
         idx = train_pool_idx[ridx]
         A_b = A_buf[idx]
         tgt_b = tgt_buf[idx]
-        psi_b = psi_buf[idx] if use_phi else None
 
-        # Permutation augmentation under the symmetric assumption (Option B1).
-        # Joint random S_n permutation per scenario applied to (A, psi, target).
-        # This is useful for the flat MLP; for DeepSets it is exactly redundant,
-        # so we skip it for clarity and a small speed gain.
+        # Under the symmetric assumption, the flat MLP benefits from random
+        # per-scenario bank permutations.  DeepSets is already equivariant, so
+        # this augmentation is redundant there.
         if use_sym and (not getattr(net, "use_deepsets", False)):
-            if use_phi:
-                A_b, psi_b, tgt_b = _permute_per_scenario(A_b, psi_b, tgt_b)
-            else:
-                A_b, tgt_b = _permute_per_scenario(A_b, tgt_b)
+            A_b, tgt_b = _permute_per_scenario(A_b, tgt_b)
 
         opt.zero_grad(set_to_none=True)
-        if use_phi:
-            x_b = torch.stack([A_b, psi_b], dim=-1)
-        else:
-            x_b = A_b.unsqueeze(-1)
+        x_b = A_b.unsqueeze(-1)
 
         logits = squeeze_last(net(x_b))
         pd_raw = torch.sigmoid(logits)
@@ -444,7 +417,7 @@ def _train_one_step(cfg: Dict[str, Any],
                 pd_pred, _ = hard_clear_pd(pd_raw, A_b, L, liab, n_it, a_dead, ell=ell)
 
         per_elem = bce_elem(pd_pred, tgt_b)
-        if mask_surv:
+        if mask_surv: #TODO do we need this?
             with torch.no_grad():
                 _, s_curr = hard_clear_pd(pd_raw, A_b, L, liab, n_it, a_dead, ell=ell)
             w = s_curr
@@ -469,10 +442,8 @@ def _train_one_step(cfg: Dict[str, Any],
                 tgt_buf[sel_train] = _mc_average_td_target(
                     cfg, nets, step, A_buf[sel_train],
                     L, liab, n_it,
-                    sigma=cfg["SIGMA"], T_total=cfg["T_TOTAL"],
-                    dt=cfg["DT"], k_surv_iters=k_phi,
-                    a_dead=a_dead, use_phi=use_phi,
-                    ell=ell,
+                    sigma=cfg["SIGMA"], dt=cfg["DT"],
+                    a_dead=a_dead, ell=ell,
                     k_mc_total=k_mc,
                     use_sym=use_sym,
                     dR_single=dR_buf[sel_train],
@@ -487,14 +458,7 @@ def _train_one_step(cfg: Dict[str, Any],
         should_eval = ((ep + 1) == (last_refresh_epoch + 1)) and ((ep + 1) >= next_eval_epoch)
         if should_eval:
             with torch.no_grad():
-                if use_phi:
-                    psi_val = iterative_breach_feature(A_buf[val_idx], L, liab,
-                                                       sigma=cfg["SIGMA"],
-                                                       T=max(cfg["T_TOTAL"] - step * cfg["DT"], 1e-8),
-                                                       k=k_phi, a_dead=a_dead, ell=ell)
-                    x_v = torch.stack([A_buf[val_idx], psi_val], dim=-1)
-                else:
-                    x_v = A_buf[val_idx].unsqueeze(-1)
+                x_v = A_buf[val_idx].unsqueeze(-1)
 
                 logits_v = squeeze_last(net(x_v))
                 pd_raw_v = torch.sigmoid(logits_v)
@@ -505,10 +469,8 @@ def _train_one_step(cfg: Dict[str, Any],
                 true_v = _mc_average_td_target(
                     cfg, nets, step, A_buf[val_idx],
                     L, liab, n_it,
-                    sigma=cfg["SIGMA"], T_total=cfg["T_TOTAL"],
-                    dt=cfg["DT"], k_surv_iters=k_phi,
-                    a_dead=a_dead, use_phi=use_phi,
-                    ell=ell,
+                    sigma=cfg["SIGMA"], dt=cfg["DT"],
+                    a_dead=a_dead, ell=ell,
                     k_mc_total=k_mc_v,
                     use_sym=use_sym,
                     dR_single=None,
@@ -520,7 +482,8 @@ def _train_one_step(cfg: Dict[str, Any],
 
                 msg = (f"[eval] step {step} ep {ep + 1}: "
                        f"MSE={val_mse:.4e}  CE={val_ce:.4e}  minCE≈{ce_min:.4e}")
-                print(msg); log.append(msg)
+                print(msg)
+                log.append(msg)
 
                 next_eval_epoch = (ep + 1) + int(cfg["EVAL_EVERY"])
 
@@ -559,8 +522,7 @@ def train_all_and_get_step0(cfg: Dict[str, Any],
 
     L, liab = build_matrices(cfg, device)
 
-    use_phi = bool(cfg.get("USE_PHI_FEATURE", True))
-    in_F = 1 + int(use_phi)
+    in_F = 1
 
     use_deepsets = bool(cfg.get("USE_DEEPSETS", False))
     ell = _sym_ell(cfg, n)
@@ -602,7 +564,7 @@ def train_all_and_get_step0(cfg: Dict[str, Any],
                 extra_intensity=float(cfg.get("EXTRA_INTENSITY", 0.30)),
                 extra_cap=float(cfg.get("EXTRA_CAP", 0.35)),
                 extra_rho=cfg.get("EXTRA_RHO", None),
-                k_surv_iters=int(cfg.get("K_SURV_ITERS", 5)),
+                k_surv_iters=int(cfg.get("EXTRA_K_SURV_ITERS", 5)),
                 L=L, liab=liab, T_total=float(cfg["T_TOTAL"]),
                 ell=ell,
             )
@@ -717,6 +679,7 @@ def sweep_correlation(cfg_base: Dict[str, Any],
             torch.save(state_for_disk, out)
     return results
 
+# not used in ayn experiments
 def sweep_correlation_warmstart(cfg_base: Dict[str, Any],
                                 corr_values: Iterable[float],
                                 save_dir: str | None = None,

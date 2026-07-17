@@ -17,10 +17,9 @@ directly from those generated paths.
 Default in the generator can occur via:
   (1) hitting the external-asset barrier (0) within a step (Brownian-bridge hit),
       which is encoded by overwriting A with A_DEAD ("a_dead sentinel");
-  (2) the stochastic "extra defaults" overlay driven by ψ(A_t) (iterated breach
-      proxy) and sampled with a 1-factor Gaussian copula.
+  (2) the optional stochastic "extra defaults" overlay from sc_data.
 
-This file does NOT use the neural networks at all.
+Does NOT use the neural networks at all.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import numpy as np
 import torch
 
-from sc_utils import build_matrices, iterative_breach_feature, infer_homogeneous_complete_ell
+from sc_utils import build_matrices, infer_homogeneous_complete_ell
 from sc_data import build_rollout_paths, apply_extra_defaults_per_step
 
 
@@ -72,11 +71,9 @@ class BaselineStats:
     # optional crude conditional curves (binning) at t=0
     # Each is dict with: edges (nbins+1,), centers (nbins,), mean (nbins,), count (nbins,)
     by_A0: Optional[Dict[str, Any]] = None
-    by_psi0: Optional[Dict[str, Any]] = None
 
     # raw sample-level t=0 data (optional; can be big)
     A0: Optional[np.ndarray] = None            # (S, n)
-    psi0: Optional[np.ndarray] = None          # (S, n)
     default_T: Optional[np.ndarray] = None     # (S, n) 1 if defaulted by maturity
     default_time: Optional[np.ndarray] = None  # (S, n) first default step index in {0..T-1}, -1 if survives
     default_cause: Optional[np.ndarray] = None # (S, n) 0 survive, 1 boundary, 2 overlay
@@ -218,9 +215,9 @@ def baseline_from_generator(
     extra_cap = float(cfg.get("EXTRA_CAP", 0.35))
     extra_rho_cfg = cfg.get("EXTRA_RHO", None)
     extra_rho = None if extra_rho_cfg is None else float(extra_rho_cfg)
-    k_surv = int(cfg.get("K_SURV_ITERS", 5))
+    k_surv = int(cfg.get("EXTRA_K_SURV_ITERS", 5))
 
-    # -------- network matrices (needed only for overlay / psi) ---------------
+    # -------- network matrices (needed only for optional overlay) ---------------
     L, liab = build_matrices(cfg, device)
     ell = infer_homogeneous_complete_ell(L)
 
@@ -290,9 +287,6 @@ def baseline_from_generator(
     cause_np = None
 
     by_A0 = None
-    by_psi0 = None
-    psi0_np = None
-
     if need_samples:
         A0 = A_path[:, 0, :].detach().cpu().numpy()
         default_T = (alive[:, -1, :] < 0.5).to(torch.int8)
@@ -318,24 +312,9 @@ def baseline_from_generator(
 
         # -------- optional conditional curves at t=0 -----------------------------
         if nbins is not None and int(nbins) > 0:
-            # ψ0 is often useful for diagnostics even if the ML net doesn't use it
-            psi0 = iterative_breach_feature(
-                torch.tensor(A0, device=device, dtype=torch.float32),
-                L, liab,
-                sigma=sigma,
-                T=T_total,
-                k=k_surv,
-                a_dead=a_dead,
-                ell=ell,
-            ).detach().cpu().numpy()
-            psi0_np = psi0
-
-            # by-bank 1D curves (own A_i or ψ_i vs default indicator)
             by_A0 = {}
-            by_psi0 = {}
             for i in range(n):
                 by_A0[f"bank_{i}"] = _bin_curve(A0[:, i], default_T_np[:, i], nbins=nbins, quantile_bins=True)
-                by_psi0[f"bank_{i}"] = _bin_curve(psi0_np[:, i], default_T_np[:, i], nbins=nbins, quantile_bins=True)
 
     stats = BaselineStats(
         corr=float(rho),
@@ -354,9 +333,7 @@ def baseline_from_generator(
         pd_T_boundary=pd_T_boundary,
         pd_T_overlay_increment=pd_T_overlay_increment,
         by_A0=by_A0,
-        by_psi0=by_psi0,
         A0=(A0 if store_raw else None),
-        psi0=(psi0_np if store_raw else None),
         default_T=(default_T_np if store_raw else None),
         default_time=(first_step_np if store_raw else None),
         default_cause=(cause_np if store_raw else None),
@@ -457,7 +434,7 @@ def main() -> None:
     p.add_argument("--save-dir", type=str, default=None, help="Directory to save results (.pt).")
     p.add_argument("--nbins", type=int, default=40, help="Bins for crude 1D conditional curves.")
     p.add_argument("--store-raw", action="store_true",
-                   help="Store raw per-scenario arrays (A0, psi0, default indicators) in saved payloads.")
+                   help="Store raw per-scenario arrays (A0, default indicators) in saved payloads.")
 
     args = p.parse_args()
 

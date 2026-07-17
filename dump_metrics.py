@@ -37,11 +37,6 @@ kL = 1.0
 L_MATRIX = None                                  # optional custom exposure matrix (list[list[float]])
 LIAB_VECTOR = None                               # optional custom liabilities; default = row sums of L_MATRIX
 
-SIGMA = 1.0
-T_TOTAL = 1.0
-DT = 0.1
-STEP = 0
-K_SURV_ITERS = 5
 
 OUT_PD_CSV = None
 OUT_MSE_CSV = None
@@ -177,11 +172,6 @@ def export_avg_pd_csv(
     model_dir: str | Path,
     A_vals: Sequence[float],
     *,
-    sigma: float,
-    T_total: float,
-    dt: float,
-    step: int,
-    k_surv_iters: int,
     a_dead: float,
     out_csv: str | Path,
 ) -> Path:
@@ -198,8 +188,7 @@ def export_avg_pd_csv(
 
     rows = []
     pd0 = predict_pd_postclearing(
-        model0, A_t, sigma=sigma, T_total=T_total, dt=dt, step=step,
-        k_surv_iters=k_surv_iters, a_dead=a_dead, L=L, liab=liab,
+        model0, A_t, a_dead=a_dead, L=L, liab=liab,
     ).numpy()
     rows.append((float(rho0), float(pd0.mean())))
 
@@ -209,8 +198,7 @@ def export_avg_pd_csv(
         if int(n_this) != int(n):
             raise RuntimeError(f"Mixed evaluation n across checkpoints: expected {n}, found {n_this} in {f.name}")
         pd = predict_pd_postclearing(
-            model, A_t, sigma=sigma, T_total=T_total, dt=dt, step=step,
-            k_surv_iters=k_surv_iters, a_dead=a_dead, L=L, liab=liab,
+            model, A_t, a_dead=a_dead, L=L, liab=liab,
         ).numpy()
         rows.append((float(rho), float(pd.mean())))
 
@@ -289,11 +277,6 @@ def main():
     export_avg_pd_csv(
         model_dir=model_dir,
         A_vals=A_INPUT,
-        sigma=SIGMA,
-        T_total=T_TOTAL,
-        dt=DT,
-        step=STEP,
-        k_surv_iters=K_SURV_ITERS,
         a_dead=A_DEAD,
         out_csv=out_pd,
     )

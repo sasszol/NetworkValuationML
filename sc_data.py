@@ -3,9 +3,9 @@ import math
 from typing import Tuple, List, Optional
 
 import torch
-from sc_utils import draw_shocks_factor, iterative_breach_feature, sample_A0_band  # uses your one‑factor/ψ
-# draw_shocks_factor: √ρ·M + √(1-ρ)·ε with variance σ²Δt  (ABM increments)
-# iterative_breach_feature: ψ(A) = 1 - φ_survival, counterparty‑aware (fixed point)
+from sc_utils import draw_shocks_factor, iterative_breach_probability, sample_A0_band
+# draw_shocks_factor: one-factor ABM increments with variance sigma^2 * dt.
+# iterative_breach_probability is used only for the optional extra-default overlay.
 
 # -------------------- Original helpers (kept for backward compatibility) --------------------
 
@@ -148,20 +148,20 @@ def apply_extra_defaults_per_step(
     k_surv_iters: int = 5,
     # ---- stochastic overlay knobs (all optional) ----
     extra_on: bool = True,
-    extra_intensity: float = 0.30,  # scales ψ to get extra default probability
+    extra_intensity: float = 0.30,  # scales breach probability to get extra default probability
     extra_cap: float = 0.35,        # ceiling for per‑name extra default probability
     extra_rho: Optional[float] = None,  # correlation for the copula (defaults to ASSET_CORR)
     seed: int = 0,
     ell: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Adds per‑step *stochastic* defaults highly correlated with A (and network via ψ),
-    but not 1‑to‑1: p_extra = λ * ψ(A_t). Sampling uses a 1‑factor Gaussian copula
-    with correlation extra_rho.
+    Adds optional per-step stochastic defaults correlated with A and the network
+    through a counterparty-aware breach proxy. Sampling uses a one-factor Gaussian
+    copula with correlation extra_rho.
 
     If ``ell`` is provided (homogeneous symmetric network: L_ij = ell off-diagonal,
-    L_ii = 0), ψ is computed via the rank-1 fast path (O(N) per scenario instead of
-    O(N^2)). Pass ``ell = kL / (N - 1)`` when ``USE_SYMMETRIC_ASSUMPTION`` is True.
+    L_ii = 0), the breach proxy is computed via the rank-1 fast path. Pass
+    ``ell = kL / (N - 1)`` when ``USE_SYMMETRIC_ASSUMPTION`` is True.
 
     Returns (A_path_with_overlay, alive_path_with_overlay).
     """
@@ -187,13 +187,13 @@ def apply_extra_defaults_per_step(
         T_now = max(float(T_total) - t * float(dt), 1e-8)
         A_t = outA[:, t, :]
 
-        # Only compute ψ for still‑alive names (others are fixed at a_dead)
-        psi_t = iterative_breach_feature(A_t, L, liab,
+        # Only compute the overlay breach probability for still-alive names
+        breach_t = iterative_breach_probability(A_t, L, liab,
                                          sigma=float(sigma), T=T_now,
                                          k=int(k_surv_iters), a_dead=float(a_dead),
                                          ell=ell)
-        # map ψ → extra default probability; clip to avoid 0/1
-        p_extra = torch.clamp(psi_t * float(extra_intensity), 0.0, float(extra_cap))
+        # map breach probability to extra default probability; clip to avoid 0/1
+        p_extra = torch.clamp(breach_t * float(extra_intensity), 0.0, float(extra_cap))
         p_extra = torch.where(A_t <= barrier, torch.zeros_like(p_extra), p_extra)
 
         # One‑factor Gaussian copula sampling for correlation across banks
